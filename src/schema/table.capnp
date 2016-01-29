@@ -5,11 +5,33 @@ struct Table {
     numRows @1 :Int64;
     columns @2 :List(Column);
     sortColumn @3 :SortColumn;
-    metadata @4 :List(Metadata);
+    chunks @4: List(Chunk);
+    metadata @5 :List(Metadata);
+
+    struct Chunk {
+        size @0 :Int64;
+        numRows @1 :Int64;
+        chunkColumns @2 :List(ColumnChunk);
+    }
+
+    struct ColumnChunk {
+        encoding @0 :Encoding;
+        compression @1 :Compression;
+    }
+
+    enum Encoding {
+        raw @0;
+        delta @1;
+    }
+
+    enum Compression {
+        none @0;
+        snappy @1;
+    }
 
     struct SortColumn {
         columnIdx @0 :Int32;
-        ascending @1 :Bool;
+        ascending @1 :Bool = true;
     }
 
     struct Metadata {
