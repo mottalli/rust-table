@@ -57,7 +57,8 @@ impl ColumnBuilder {
 pub struct Table {
     name: String,
     num_rows: usize,
-    columns: Vec<Column>
+    columns: Vec<Column>,
+    main_file: PathBuf
 }
 
 impl Table {
@@ -141,7 +142,8 @@ impl TableBuilder {
         let mut table = Table {
             name: self.name.clone(),
             num_rows: 0,
-            columns: Vec::new()
+            columns: Vec::new(),
+            main_file: path.to_owned()
         };
 
         table.columns = self.columns.iter().map(|b| b.create(&table)).collect();

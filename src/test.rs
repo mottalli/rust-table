@@ -27,7 +27,7 @@ impl TestPath {
         let path_name: PathBuf = unsafe {
             let mut tmp_path = PathBuf::from("/tmp");
             let buffer = tempnam(CString::new(tmp_path.to_str().unwrap()).unwrap().as_ptr(), ptr::null_mut());
-            let path_name = CStr::from_ptr(buffer).to_str().expect("Temp path name contains non-UTF8 chars");
+            let path_name = CStr::from_ptr(buffer).to_str().unwrap();
             tmp_path.push(path_name);
             free(buffer as *mut self::libc::c_void);
             tmp_path
