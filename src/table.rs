@@ -1,25 +1,31 @@
 use ::table_capnp;
 use std::path::{Path, PathBuf};
 use std::io;
+use std::fmt;
+use std::collections::hash_map::HashMap;
 
 #[derive(Copy, Clone)]
-pub enum ColumnDatatype {
-    // Basic types suppored by the table backend
-    Boolean,
+/// Basic types suppored by the table backend
+pub enum BackendDatatype {
     Byte, Int32, Int64,
     Float, Double,
-    UTF8,
-    FixedLength(i32),
+    FixedLength(i32), VariableLength
+}
 
-    // Extended types
-    Timestamp, TimestampTZ, Geo
+/// Column types. Not necessarily correspond to the backend types
+/// (for example, a boolean column is stored using a Byte)
+#[derive(Copy, Clone)]
+pub enum ColumnDatatype {
+    Byte, Int32, Int64,
+    Float, Double,
+    FixedLength(i32),
+    UTF8, VariableLength,
+    Timestamp, TimestampTZ
 }
 
 pub struct Column {
     name: String,
     datatype: ColumnDatatype,
-    nullable: bool,
-    is_part_of_pk: bool,
     table_ptr: *const Table
 }
 
@@ -28,8 +34,6 @@ impl Column {
         ColumnBuilder {
             name: String::from(name),
             datatype: datatype,
-            nullable: true,
-            pk: false
         }
     }
 }
@@ -38,21 +42,13 @@ impl Column {
 pub struct ColumnBuilder {
     name: String,
     datatype: ColumnDatatype,
-    nullable: bool,
-    pk: bool
 }
 
 impl ColumnBuilder {
-    pub fn null(&mut self) -> &mut Self { self.nullable = true; self }
-    pub fn not_null(&mut self) -> &mut Self { self.nullable = false; self }
-    pub fn pk(&mut self) -> &mut Self { self.pk = true; self }
-
     fn create(&self, table: &Table) -> Column {
         Column {
             name: self.name.clone(),
             datatype: self.datatype,
-            nullable: self.nullable,
-            is_part_of_pk: self.pk,
             table_ptr: unsafe { table as *const Table }
         }
     }
@@ -80,13 +76,68 @@ pub struct TableBuilder {
     columns: Vec<ColumnBuilder>
 }
 
+enum TableError {
+    FileAlreadyExists,
+    InvalidPath(PathBuf),
+    InvalidTable(String),
+    IoError(io::Error)
+}
+
+impl fmt::Debug for TableError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match *self {
+            TableError::FileAlreadyExists => write!(f, "File already exists"),
+            TableError::InvalidPath(ref p) => write!(f, "Invalid path: {}", p.display()),
+            TableError::InvalidTable(ref desc) => write!(f, "Invalid table: {}", desc),
+            TableError::IoError(ref e) => e.fmt(f),
+        }
+    }
+}
+
+impl From<io::Error> for TableError {
+    fn from(err: io::Error) -> TableError { TableError::IoError(err) }
+}
+
+type TableResult<T> = Result<T, TableError>;
+
 impl TableBuilder {
-    pub fn column(&mut self, builder: &ColumnBuilder) -> &mut Self {
-        self.columns.push(builder.clone());
+    pub fn column(&mut self, name: &str, datatype: ColumnDatatype) -> &mut Self {
+        self.columns.push(Column::build(name, datatype));
         self
     }
 
-    pub fn at<P: AsRef<Path>>(&self, path: P) -> io::Result<Table> {
+    /// Creates the table at the specified path
+    pub fn at<P: AsRef<Path>>(&self, path_ref: P) -> TableResult<Table> {
+        let path = path_ref.as_ref();
+
+        // Check that the file does NOT exist
+        if path.is_dir() {
+            return Err(TableError::InvalidPath(path.to_owned()));
+        } else if path.exists() {
+            return Err(TableError::FileAlreadyExists);
+        }
+
+
+        // Check that the parent path exists and it's valid
+        match path.parent() {
+            None => return Err(TableError::InvalidPath(path.to_owned())),
+            Some(ref parent) => {
+                if !parent.exists() {
+                    return Err(TableError::InvalidPath(path.to_owned()))
+                }
+            }
+        }
+
+        // Make sure the table names are not duplicated
+        let mut nameCount: HashMap<&str, i32> = HashMap::new();
+        for ref column in self.columns.iter() {
+            let cnt = nameCount.entry(&column.name).or_insert(0);
+            *cnt += 1;
+            if *cnt > 1 {
+                return Err(TableError::InvalidTable(format!("Column '{}' is specified more than once", column.name)));
+            }
+        }
+
         let mut table = Table {
             name: self.name.clone(),
             num_rows: 0,
