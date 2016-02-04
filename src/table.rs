@@ -1,28 +1,18 @@
-use ::table_capnp;
 use std::path::{Path, PathBuf};
 use std::io;
 use std::fmt;
 use std::collections::hash_map::HashMap;
 
-#[derive(Copy, Clone)]
+// ----------------------------------------------------------------------------
 /// Basic types suppored by the table backend
-pub enum BackendDatatype {
-    Byte, Int32, Int64,
-    Float, Double,
-    FixedLength(i32), VariableLength
-}
-
-/// Column types. Not necessarily correspond to the backend types
-/// (for example, a boolean column is stored using a Byte)
 #[derive(Copy, Clone)]
 pub enum ColumnDatatype {
     Byte, Int32, Int64,
-    Float, Double,
-    FixedLength(i32),
-    UTF8, VariableLength,
-    Timestamp, TimestampTZ
+    Float,
+    FixedLength(i32), VariableLength
 }
 
+// ----------------------------------------------------------------------------
 pub struct Column {
     name: String,
     datatype: ColumnDatatype,
@@ -38,6 +28,7 @@ impl Column {
     }
 }
 
+// ----------------------------------------------------------------------------
 #[derive(Clone)]
 pub struct ColumnBuilder {
     name: String,
@@ -54,6 +45,7 @@ impl ColumnBuilder {
     }
 }
 
+// ----------------------------------------------------------------------------
 pub struct Table {
     name: String,
     num_rows: usize,
@@ -70,13 +62,17 @@ impl Table {
     }
 
     pub fn num_columns(&self) -> usize { self.columns.len() }
+
+    pub fn create_inserter(&mut self) -> TableInserter {
+        TableInserter {
+            table: self
+        }
+    }
+
+    pub fn num_rows(&self) -> usize { self.num_rows }
 }
 
-pub struct TableBuilder {
-    name: String,
-    columns: Vec<ColumnBuilder>
-}
-
+// ----------------------------------------------------------------------------
 enum TableError {
     FileAlreadyExists,
     InvalidPath(PathBuf),
@@ -100,6 +96,12 @@ impl From<io::Error> for TableError {
 }
 
 type TableResult<T> = Result<T, TableError>;
+
+// ----------------------------------------------------------------------------
+pub struct TableBuilder {
+    name: String,
+    columns: Vec<ColumnBuilder>
+}
 
 impl TableBuilder {
     pub fn column(&mut self, name: &str, datatype: ColumnDatatype) -> &mut Self {
@@ -129,7 +131,7 @@ impl TableBuilder {
             }
         }
 
-        // Make sure the table names are not duplicated
+        // Make sure the column names are not duplicated
         let mut nameCount: HashMap<&str, i32> = HashMap::new();
         for ref column in self.columns.iter() {
             let cnt = nameCount.entry(&column.name).or_insert(0);
@@ -149,4 +151,20 @@ impl TableBuilder {
         table.columns = self.columns.iter().map(|b| b.create(&table)).collect();
         Ok(table)
     }
+}
+
+// ----------------------------------------------------------------------------
+struct TableInserter<'a> {
+    table: &'a mut Table
+}
+
+pub enum ColumnValue {
+    Null,
+    Byte(u8), Int32(i32), Int64(i64),
+    Float(f32),
+    FixedLength(Vec<u8>), VariableLength(Vec<u8>)
+}
+
+impl<'a> TableInserter<'a> {
+    pub fn insert_row(&mut self, row: &Vec<ColumnValue>) {}
 }
