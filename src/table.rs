@@ -1,7 +1,10 @@
 use std::path::{Path, PathBuf};
 use std::io;
+use std::io::{Write};
 use std::fmt;
 use std::collections::hash_map::HashMap;
+use std::sync::{Arc, RwLock};
+use std::fs::File;
 
 // ----------------------------------------------------------------------------
 /// Basic types suppored by the table backend
@@ -16,7 +19,7 @@ pub enum ColumnDatatype {
 pub struct Column {
     name: String,
     datatype: ColumnDatatype,
-    table_ptr: *const Table
+    num_column: usize
 }
 
 impl Column {
@@ -26,6 +29,10 @@ impl Column {
             datatype: datatype,
         }
     }
+
+    pub fn datatype(&self) -> &ColumnDatatype { &self.datatype }
+    pub fn name(&self) -> &str { &self.name }
+    pub fn num_column_in_table(&self) -> usize { self.num_column }
 }
 
 // ----------------------------------------------------------------------------
@@ -35,22 +42,13 @@ pub struct ColumnBuilder {
     datatype: ColumnDatatype,
 }
 
-impl ColumnBuilder {
-    fn create(&self, table: &Table) -> Column {
-        Column {
-            name: self.name.clone(),
-            datatype: self.datatype,
-            table_ptr: unsafe { table as *const Table }
-        }
-    }
-}
-
 // ----------------------------------------------------------------------------
 pub struct Table {
     name: String,
     num_rows: usize,
     columns: Vec<Column>,
-    main_file: PathBuf
+    file_path: PathBuf,
+    file: File
 }
 
 impl Table {
@@ -61,19 +59,20 @@ impl Table {
         }
     }
 
+    pub fn columns(&self) -> &Vec<Column> { &self.columns }
+    pub fn column(&self, idx: usize) -> &Column { &self.columns[idx] }
+    pub fn column_by_name(&self, name: &str) -> Option<&Column> {
+        self.columns.iter().find(|ref c| c.name == name)
+    }
     pub fn num_columns(&self) -> usize { self.columns.len() }
 
-    pub fn create_inserter(&mut self) -> TableInserter {
-        TableInserter {
-            table: self
-        }
-    }
-
     pub fn num_rows(&self) -> usize { self.num_rows }
+
+    pub fn name(&self) -> &str { &self.name }
 }
 
 // ----------------------------------------------------------------------------
-enum TableError {
+pub enum TableError {
     FileAlreadyExists,
     InvalidPath(PathBuf),
     InvalidTable(String),
@@ -95,7 +94,7 @@ impl From<io::Error> for TableError {
     fn from(err: io::Error) -> TableError { TableError::IoError(err) }
 }
 
-type TableResult<T> = Result<T, TableError>;
+pub type TableResult<T> = Result<T, TableError>;
 
 // ----------------------------------------------------------------------------
 pub struct TableBuilder {
@@ -132,32 +131,52 @@ impl TableBuilder {
         }
 
         // Make sure the column names are not duplicated
-        let mut nameCount: HashMap<&str, i32> = HashMap::new();
+        let mut name_count: HashMap<&str, i32> = HashMap::new();
         for ref column in self.columns.iter() {
-            let cnt = nameCount.entry(&column.name).or_insert(0);
+            let cnt = name_count.entry(&column.name).or_insert(0);
             *cnt += 1;
             if *cnt > 1 {
                 return Err(TableError::InvalidTable(format!("Column '{}' is specified more than once", column.name)));
             }
         }
 
+        // Create the file that will hold this table
+        let file = try!(File::create(&path_ref));
+
         let mut table = Table {
             name: self.name.clone(),
             num_rows: 0,
             columns: Vec::new(),
-            main_file: path.to_owned()
+            file_path: path.to_owned(),
+            file: file
         };
 
-        table.columns = self.columns.iter().map(|b| b.create(&table)).collect();
+        for ref column_builder in &self.columns {
+            let column = Column {
+                name: column_builder.name.clone(),
+                datatype: column_builder.datatype,
+                num_column: table.columns.len()
+            };
+
+            table.columns.push(column);
+        }
+
+        try!(TableFormat::write_header(&mut table));
+
         Ok(table)
     }
 }
 
 // ----------------------------------------------------------------------------
-struct TableInserter<'a> {
-    table: &'a mut Table
+struct TableFormat;
+impl TableFormat {
+    fn write_header(table: &mut Table) -> io::Result<()> {
+        try!(table.file.write("SCF".as_bytes()));
+        Ok(())
+    }
 }
 
+// ----------------------------------------------------------------------------
 pub enum ColumnValue {
     Null,
     Byte(u8), Int32(i32), Int64(i64),
@@ -165,6 +184,172 @@ pub enum ColumnValue {
     FixedLength(Vec<u8>), VariableLength(Vec<u8>)
 }
 
-impl<'a> TableInserter<'a> {
-    pub fn insert_row(&mut self, row: &Vec<ColumnValue>) {}
+// ----------------------------------------------------------------------------
+pub enum InsertError {
+    InvalidNumberOfColumns{ got: usize, expected: usize }
+}
+
+pub type InsertResult<T> = Result<T, InsertError>;
+
+// ----------------------------------------------------------------------------
+pub struct TableInserter {
+    table: Arc<RwLock<Table>>
+}
+
+impl TableInserter {
+    pub fn new(table: Arc<RwLock<Table>>) -> TableInserter {
+        TableInserter {
+            table: table
+        }
+    }
+
+    pub fn enqueue_row(&mut self, row: &Vec<ColumnValue>) -> InsertResult<()> {
+        let table = self.table.read().unwrap();
+
+        // Validate number of columns
+        let expected = table.num_columns();
+        let got = row.len();
+        if got != expected {
+            return Err(InsertError::InvalidNumberOfColumns{
+                got: got, expected: expected
+            })
+        }
+
+        unimplemented!();
+    }
+
+    fn flush(&mut self) -> InsertResult<()> {
+        let mut table = self.table.write().unwrap();
+        unimplemented!();
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use std::sync::{Arc, RwLock};
+
+    use std::fs;
+    use std::path::PathBuf;
+
+    use ::os;
+    use ::table::{Table, ColumnDatatype, TableInserter, ColumnValue};
+
+
+    struct TestPath {
+        path: PathBuf
+    }
+
+    impl TestPath {
+        fn new() -> TestPath {
+            let path = os::tempname("table");
+            fs::create_dir(&path);
+
+            TestPath {
+                path: path
+            }
+        }
+
+        fn file_name(&self, name: &str) -> PathBuf {
+            let mut tmp = self.path.clone();
+            tmp.push(name);
+            tmp
+        }
+    }
+
+    impl Drop for TestPath {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.path).ok();
+        }
+    }
+
+    #[test]
+    fn table_can_be_built() {
+        let test_path = TestPath::new();
+
+        Table::build("test")
+            .column("id", ColumnDatatype::Int32)
+            .at(test_path.file_name("test.table")).unwrap();
+    }
+
+    #[test]
+    fn column_accessors() {
+        let test_path = TestPath::new();
+
+        let table = Table::build("test")
+            .column("col1", ColumnDatatype::Int32)
+            .column("col2", ColumnDatatype::Float)
+            .at(test_path.file_name("test.table")).unwrap();
+
+        assert_eq!(table.column(0).name(), "col1");
+        assert_eq!(table.column(1).name(), "col2");
+        assert!(table.column_by_name("col1").is_some());
+        assert!(table.column_by_name("col3").is_none());
+        assert_eq!(table.column_by_name("col2").unwrap().num_column_in_table(), 1);
+    }
+
+    #[test]
+    fn table_generates_right_columns() {
+        let test_path = TestPath::new();
+
+        Table::build("test")
+            .column("col1", ColumnDatatype::Int32)
+            .column("col2", ColumnDatatype::Int32)
+            .at(test_path.file_name("test.table")).unwrap();
+    }
+
+    #[test]
+    fn table_builder_in_invalid_path() {
+        let builder = Table::build("test") ;
+        assert!(builder.at("/invalid/path/test.table").is_err());
+        assert!(builder.at("/tmp").is_err());
+        assert!(builder.at("/").is_err());
+        assert!(builder.at("").is_err());
+    }
+
+    #[test]
+    #[should_panic(expected="more than once")]
+    fn table_with_duplicated_columns() {
+        let table = Table::build("test")
+            .column("id", ColumnDatatype::Int32)
+            .column("id", ColumnDatatype::Int64)
+            .at("/tmp/test.table").unwrap();
+    }
+
+    #[test]
+    fn a_single_row_can_be_inserted() {
+        let test_path = TestPath::new();
+
+        let mut table = Table::build("test")
+            .column("nullcol", ColumnDatatype::Byte)
+            .column("bytecol", ColumnDatatype::Byte)
+            .column("int32col", ColumnDatatype::Int32)
+            .column("int64col", ColumnDatatype::Int64)
+            .column("floatcol", ColumnDatatype::Float)
+            .column("fixedlengthcol", ColumnDatatype::FixedLength(5))
+            .column("variablelengthcol", ColumnDatatype::VariableLength)
+            .at(test_path.file_name("test.table")).unwrap();
+
+        let lock: Arc<RwLock<Table>> = Arc::new(RwLock::new(table));
+        {
+            let mut inserter = TableInserter::new(lock.clone());
+
+            let row = vec!(
+                ColumnValue::Null,
+                ColumnValue::Byte(2),
+                ColumnValue::Int32(300),
+                ColumnValue::Int64(400000000i64),
+                ColumnValue::Float(3.14159),
+                ColumnValue::FixedLength(vec!(1,2,3,4,5)),
+                ColumnValue::VariableLength("Hello world".to_string().into()),
+            );
+            inserter.enqueue_row(&row);
+        }
+
+        // Restore the table handler
+        table = Arc::try_unwrap(lock).ok().expect("Pending references to table mutex!")
+            .into_inner().unwrap();               // ... which gives us back the table.
+
+        assert_eq!(table.num_rows(), 1);
+
+    }
 }
