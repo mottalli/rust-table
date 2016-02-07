@@ -1,7 +1,7 @@
 extern crate capnp;
 extern crate libc;
 
-pub mod table;
+pub mod storage;
 
 mod test;
 mod os;
