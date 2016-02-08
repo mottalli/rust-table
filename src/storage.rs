@@ -8,6 +8,18 @@ use std::fs::File;
 use std::iter::Iterator;
 use std::str;
 use std::{i8, i32, i64, f32};
+use std::mem;
+use std::slice;
+
+// ----------------------------------------------------------------------------
+/// Helper function
+fn get_slice_bytes<'a, T>(s: &'a [T]) -> &'a [u8] 
+    where T: Sized
+{
+    let ptr = s.as_ptr() as *const u8;
+    let size = mem::size_of::<T>() * s.len();
+    unsafe { slice::from_raw_parts(ptr, size) }
+}
 
 // ----------------------------------------------------------------------------
 /// Basic types suppored by the storage backend
@@ -452,7 +464,8 @@ impl<N> ChunkGenerator for NumericChunkGenerator<N>
     }
 
     fn get_encoded_chunk<'a>(&'a mut self) -> ChunkEncodingResult<'a> {
-        unimplemented!();
+        let result = get_slice_bytes(&self.values);
+        ChunkEncodingResult(ChunkEncoding::None, result)
     }
 
     fn reset(&mut self) {
@@ -464,7 +477,8 @@ impl<N> ChunkGenerator for NumericChunkGenerator<N>
 struct FixedLengthChunkGenerator {
     value_size: usize,
     nulls: Vec<bool>,
-    values: Vec<u8>
+    values: Vec<u8>,
+    encoded_chunk_buffer: Vec<u8>
 }
 
 impl FixedLengthChunkGenerator {
@@ -472,7 +486,8 @@ impl FixedLengthChunkGenerator {
         FixedLengthChunkGenerator {
             value_size: value_size as usize,
             nulls: Vec::with_capacity(num_values),
-            values: Vec::with_capacity(num_values*value_size as usize)
+            values: Vec::with_capacity(num_values*value_size as usize),
+            encoded_chunk_buffer: Vec::new()
         }
     }
 }
@@ -507,7 +522,13 @@ impl ChunkGenerator for FixedLengthChunkGenerator {
     }
 
     fn get_encoded_chunk<'a>(&'a mut self) -> ChunkEncodingResult<'a> {
-        unimplemented!();
+        let nulls: Vec<u8> = self.nulls.iter().map(|n| if *n { 1 } else { 0 }).collect();
+
+        self.encoded_chunk_buffer.clear();
+        self.encoded_chunk_buffer.write(&nulls);
+        self.encoded_chunk_buffer.write(&self.values);
+
+        ChunkEncodingResult(ChunkEncoding::None, &self.encoded_chunk_buffer)
     }
 
     fn reset(&mut self) {
@@ -519,14 +540,16 @@ impl ChunkGenerator for FixedLengthChunkGenerator {
 // ----------------------------------------------------------------------------
 struct VariableLengthChunkGenerator {
     sizes: Vec<i32>,
-    values: Vec<u8>
+    values: Vec<u8>,
+    encoded_chunk_buffer: Vec<u8>
 }
 
 impl VariableLengthChunkGenerator {
     fn new(num_values: usize) -> VariableLengthChunkGenerator {
         VariableLengthChunkGenerator {
             sizes: Vec::with_capacity(num_values),
-            values: Vec::new()
+            values: Vec::new(),
+            encoded_chunk_buffer: Vec::new()
         }
     }
 }
@@ -555,7 +578,11 @@ impl ChunkGenerator for VariableLengthChunkGenerator {
     }
 
     fn get_encoded_chunk<'a>(&'a mut self) -> ChunkEncodingResult<'a> {
-        unimplemented!();
+        self.encoded_chunk_buffer.clear();
+        self.encoded_chunk_buffer.write(get_slice_bytes(&self.sizes));
+        self.encoded_chunk_buffer.write(&self.values);
+
+        ChunkEncodingResult(ChunkEncoding::None, &self.encoded_chunk_buffer)
     }
 
     fn reset(&mut self) {
@@ -679,7 +706,8 @@ mod test {
 
 
     struct TestPath {
-        path: PathBuf
+        path: PathBuf,
+        delete: bool
     }
 
     impl TestPath {
@@ -688,7 +716,8 @@ mod test {
             fs::create_dir(&path);
 
             TestPath {
-                path: path
+                path: path,
+                delete: true
             }
         }
 
@@ -697,6 +726,10 @@ mod test {
             tmp.push(name);
             tmp
         }
+
+        fn dont_delete(&mut self) {
+            self.delete = false;
+        }
     }
 
     /// A storage that is commonly used for tests
@@ -704,7 +737,6 @@ mod test {
 
     impl TestStorage {
         fn new(path: &Path) -> Storage {
-            let test_path = TestPath::new();
             Storage::build("test")
                 .column("nullcol", ColumnDatatype::Byte)
                 .column("bytecol", ColumnDatatype::Byte)
@@ -713,13 +745,15 @@ mod test {
                 .column("floatcol", ColumnDatatype::Float)
                 .column("fixedlengthcol", ColumnDatatype::FixedLength(5))
                 .column("variablelengthcol", ColumnDatatype::VariableLength)
-                .at(test_path.file_name("test.storage")).unwrap()
+                .at(path).unwrap()
         }
     }
 
     impl Drop for TestPath {
         fn drop(&mut self) {
-            fs::remove_dir_all(&self.path).ok();
+            if self.delete {
+                fs::remove_dir_all(&self.path).ok();
+            }
         }
     }
 
@@ -778,8 +812,11 @@ mod test {
 
     #[test]
     fn a_single_row_can_be_inserted() {
-        let test_path = TestPath::new();
-        let mut storage = TestStorage::new(test_path.file_name("test.storage").as_path());
+        let mut test_path = TestPath::new();
+        test_path.dont_delete();
+        let test_file = test_path.file_name("test.storage");
+
+        let mut storage = TestStorage::new(test_file.as_path());
 
         let lock: Arc<RwLock<Storage>> = Arc::new(RwLock::new(storage));
         {
