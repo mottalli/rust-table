@@ -13,7 +13,7 @@ use std::slice;
 
 // ----------------------------------------------------------------------------
 /// Helper function
-fn get_slice_bytes<'a, T>(s: &'a [T]) -> &'a [u8] 
+fn get_slice_bytes<'a, T>(s: &'a [T]) -> &'a [u8]
     where T: Sized
 {
     let ptr = s.as_ptr() as *const u8;
@@ -276,18 +276,18 @@ impl fmt::Display for ColumnValue {
                 // Try to convert the value to a string. If not possible,
                 // display the raw bytes.
                 match str::from_utf8(v) {
-                    Ok(s) => write!(f, "\"{}\"", s),
+                    Ok(s) => { write!(f, "\"{}\"", s); },
                     Err(_) => {
                         try!(write_bytes(f, &mut v.iter().take(5)));
                         if v.len() > 5 {
                             write!(f, "...");
                         }
-                        Ok(())
                     }
                 };
                 write!(f, ")")
             }
-        }
+        };
+        Ok(())
     }
 }
 
@@ -422,11 +422,11 @@ enum ChunkCompression {
     None, Snappy
 }
 
-struct ChunkEncodingResult<'a>(ChunkEncoding, &'a [u8]);
+struct EncodedChunk<'a>(ChunkEncoding, &'a [u8]);
 
 trait ChunkGenerator {
     fn validate_value(&self, value: &ColumnValue) -> InsertResult<()>;
-    fn get_encoded_chunk<'a>(&'a mut self) -> ChunkEncodingResult<'a>;
+    fn get_encoded_chunk<'a>(&'a mut self) -> EncodedChunk<'a>;
     fn reset(&mut self);
 
     /// Precondition: self.validate_value(value).is_ok()
@@ -463,9 +463,9 @@ impl<N> ChunkGenerator for NumericChunkGenerator<N>
         }
     }
 
-    fn get_encoded_chunk<'a>(&'a mut self) -> ChunkEncodingResult<'a> {
+    fn get_encoded_chunk<'a>(&'a mut self) -> EncodedChunk<'a> {
         let result = get_slice_bytes(&self.values);
-        ChunkEncodingResult(ChunkEncoding::None, result)
+        EncodedChunk(ChunkEncoding::None, result)
     }
 
     fn reset(&mut self) {
@@ -513,7 +513,7 @@ impl ChunkGenerator for FixedLengthChunkGenerator {
                 ColumnValue::Null => self.nulls.push(true),
                 ColumnValue::FixedLength(ref v) => {
                     self.nulls.push(false);
-                    self.values.write(&v[..]);
+                    self.values.write(&v[..]).unwrap();
                 },
                 // Should never get to this point
                 _ => panic!("Internal error: Received an invalid value size")
@@ -521,14 +521,14 @@ impl ChunkGenerator for FixedLengthChunkGenerator {
         }
     }
 
-    fn get_encoded_chunk<'a>(&'a mut self) -> ChunkEncodingResult<'a> {
+    fn get_encoded_chunk<'a>(&'a mut self) -> EncodedChunk<'a> {
         let nulls: Vec<u8> = self.nulls.iter().map(|n| if *n { 1 } else { 0 }).collect();
 
         self.encoded_chunk_buffer.clear();
         self.encoded_chunk_buffer.write(&nulls);
         self.encoded_chunk_buffer.write(&self.values);
 
-        ChunkEncodingResult(ChunkEncoding::None, &self.encoded_chunk_buffer)
+        EncodedChunk(ChunkEncoding::None, &self.encoded_chunk_buffer)
     }
 
     fn reset(&mut self) {
@@ -569,7 +569,7 @@ impl ChunkGenerator for VariableLengthChunkGenerator {
                 ColumnValue::Null => self.sizes.push(-1),
                 ColumnValue::VariableLength(ref v) => {
                     self.sizes.push(v.len() as i32);
-                    self.values.write(&v[..]);
+                    self.values.write(v).unwrap();
                 },
                 // Should never get to this point
                 _ => panic!("Internal error: Received an invalid value")
@@ -577,12 +577,12 @@ impl ChunkGenerator for VariableLengthChunkGenerator {
         }
     }
 
-    fn get_encoded_chunk<'a>(&'a mut self) -> ChunkEncodingResult<'a> {
+    fn get_encoded_chunk<'a>(&'a mut self) -> EncodedChunk<'a> {
         self.encoded_chunk_buffer.clear();
         self.encoded_chunk_buffer.write(get_slice_bytes(&self.sizes));
         self.encoded_chunk_buffer.write(&self.values);
 
-        ChunkEncodingResult(ChunkEncoding::None, &self.encoded_chunk_buffer)
+        EncodedChunk(ChunkEncoding::None, &self.encoded_chunk_buffer)
     }
 
     fn reset(&mut self) {
@@ -670,7 +670,7 @@ impl StorageInserter {
             let mut storage = self.storage.write().unwrap();
             for chunk_generator in self.chunk_generators.iter_mut() {
                 {
-                    let ChunkEncodingResult(encoding, encoded_chunk) = chunk_generator.get_encoded_chunk();
+                    let EncodedChunk(encoding, encoded_chunk) = chunk_generator.get_encoded_chunk();
 
                     // TODO: Write the format
                     try!(storage.file.write(encoded_chunk));
@@ -713,7 +713,7 @@ mod test {
     impl TestPath {
         fn new() -> TestPath {
             let path = os::tempname("storage");
-            fs::create_dir(&path);
+            fs::create_dir(&path).unwrap();
 
             TestPath {
                 path: path,
@@ -763,7 +763,8 @@ mod test {
 
         Storage::build("test")
             .column("id", ColumnDatatype::Int32)
-            .at(test_path.file_name("test.storage")).unwrap();
+            .at(test_path.file_name("test.storage"))
+            .unwrap();
     }
 
     #[test]
@@ -804,10 +805,11 @@ mod test {
     #[test]
     #[should_panic(expected="more than once")]
     fn storage_with_duplicated_columns() {
-        let storage = Storage::build("test")
+        Storage::build("test")
             .column("id", ColumnDatatype::Int32)
             .column("id", ColumnDatatype::Int64)
-            .at("/tmp/test.storage").unwrap();
+            .at("/tmp/test.storage")
+            .unwrap();
     }
 
     #[test]
@@ -848,7 +850,7 @@ mod test {
     #[test]
     fn invalid_values_cannot_be_inserted() {
         let test_path = TestPath::new();
-        let mut storage = TestStorage::new(test_path.file_name("test.storage").as_path());
+        let storage = TestStorage::new(test_path.file_name("test.storage").as_path());
 
         let lock: Arc<RwLock<Storage>> = Arc::new(RwLock::new(storage));
         {
