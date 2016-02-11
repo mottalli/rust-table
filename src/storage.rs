@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::io;
-use std::io::{Write};
+use std::io::{Read, Write, Seek, Cursor};
 use std::fmt;
 use std::collections::hash_map::HashMap;
 use std::sync::{Arc, RwLock};
@@ -10,6 +10,10 @@ use std::str;
 use std::{i8, i32, i64, f32};
 use std::mem;
 use std::slice;
+
+use ::storage_capnp::stripe_header::Builder as StripeHeaderBuilder;
+use capnp::serialize_packed;
+use capnp::message::Builder as ProtoBuilder;
 
 // ----------------------------------------------------------------------------
 /// Helper function
@@ -92,19 +96,54 @@ pub struct ColumnBuilder {
 }
 
 // ----------------------------------------------------------------------------
-pub struct Storage {
+pub trait StorageBackend : Read + Write + Seek {}
+impl StorageBackend for File {}
+impl StorageBackend for Cursor<Vec<u8>> {}
+
+// ----------------------------------------------------------------------------
+pub struct Storage<Backend>
+    where Backend: StorageBackend
+{
     num_rows: usize,
     columns: Vec<Column>,
-    file_path: PathBuf,
-    file: File
+    backend: Backend
 }
 
-impl Storage {
-    pub fn build(name: &str) -> StorageBuilder {
-        StorageBuilder {
-            name: String::from(name),
-            columns: Vec::new()
+impl<Backend> Storage<Backend>
+    where Backend: StorageBackend
+{
+    fn init(backend: Backend, builder: &StorageBuilder) -> StorageResult<Storage<Backend>> {
+        // Make sure the column names are not duplicated
+        let mut name_count: HashMap<&str, i32> = HashMap::new();
+        for ref column in builder.columns.iter() {
+            let cnt = name_count.entry(&column.name).or_insert(0);
+            *cnt += 1;
+            if *cnt > 1 {
+                return Err(StorageError::InvalidFormat(format!("Column '{}' is specified more than once", column.name)));
+            }
         }
+
+        let mut storage = Storage {
+            num_rows: 0,
+            columns: Vec::new(),
+            backend: backend
+        };
+
+        // Create the columns
+        for ref column_builder in &builder.columns {
+            let column = Column {
+                name: column_builder.name.clone(),
+                datatype: column_builder.datatype,
+                datatype_info: DatatypeInfo::new(&column_builder.datatype),
+                num_column: storage.columns.len()
+            };
+
+            storage.columns.push(column);
+        }
+
+        try!(StorageFormat::write_header(&mut storage.backend));
+
+        Ok(storage)
     }
 
     pub fn columns(&self) -> &Vec<Column> { &self.columns }
@@ -131,6 +170,9 @@ impl Storage {
         (blocks_in_stripe*disk_block_size) / max_size
     }
 }
+
+pub type DiskStorage = Storage<File>;
+pub type MemoryStorage = Storage<Cursor<Vec<u8>>>;
 
 // ----------------------------------------------------------------------------
 #[derive(Debug)]
@@ -160,18 +202,20 @@ pub type StorageResult<T> = Result<T, StorageError>;
 
 // ----------------------------------------------------------------------------
 pub struct StorageBuilder {
-    name: String,
     columns: Vec<ColumnBuilder>
 }
 
 impl StorageBuilder {
+    fn new() -> StorageBuilder {
+        StorageBuilder { columns: Vec::new() }
+    }
     pub fn column(&mut self, name: &str, datatype: ColumnDatatype) -> &mut Self {
         self.columns.push(Column::build(name, datatype));
         self
     }
 
     /// Creates the storage at the specified path
-    pub fn at<P: AsRef<Path>>(&self, path_ref: P) -> StorageResult<Storage> {
+    pub fn at<P: AsRef<Path>>(&self, path_ref: P) -> StorageResult<DiskStorage> {
         let path = path_ref.as_ref();
 
         // Check that the file does NOT exist
@@ -180,7 +224,6 @@ impl StorageBuilder {
         } else if path.exists() {
             return Err(StorageError::FileAlreadyExists);
         }
-
 
         // Check that the parent path exists and it's valid
         match path.parent() {
@@ -192,48 +235,44 @@ impl StorageBuilder {
             }
         }
 
-        // Make sure the column names are not duplicated
-        let mut name_count: HashMap<&str, i32> = HashMap::new();
-        for ref column in self.columns.iter() {
-            let cnt = name_count.entry(&column.name).or_insert(0);
-            *cnt += 1;
-            if *cnt > 1 {
-                return Err(StorageError::InvalidFormat(format!("Column '{}' is specified more than once", column.name)));
-            }
-        }
-
         // Create the file that will hold this storage
         let file = try!(File::create(&path_ref));
 
-        let mut storage = Storage {
-            num_rows: 0,
-            columns: Vec::new(),
-            file_path: path.to_owned(),
-            file: file
-        };
+        Storage::init(file, self)
+    }
 
-        for ref column_builder in &self.columns {
-            let column = Column {
-                name: column_builder.name.clone(),
-                datatype: column_builder.datatype,
-                datatype_info: DatatypeInfo::new(&column_builder.datatype),
-                num_column: storage.columns.len()
-            };
-
-            storage.columns.push(column);
-        }
-
-        try!(StorageFormat::write_header(&mut storage));
-
-        Ok(storage)
+    pub fn in_memory(&self) -> StorageResult<MemoryStorage> {
+        let mem_backend = Cursor::new(Vec::<u8>::new());
+        Storage::init(mem_backend, self)
     }
 }
 
 // ----------------------------------------------------------------------------
 struct StorageFormat;
 impl StorageFormat {
-    fn write_header(storage: &mut Storage) -> io::Result<()> {
-        try!(storage.file.write("SCF".as_bytes()));
+    fn write_header(backend: &mut StorageBackend) -> io::Result<()> {
+        try!(backend.write("SCF".as_bytes()));
+        Ok(())
+    }
+
+    fn append_stripe(backend: &mut StorageBackend, stripe: &Vec<EncodedChunk>) -> io::Result<()> {
+        let num_rows = if stripe.len() == 0 {
+                return Ok(());
+            } else {
+                let EncodedChunk(encoding, encoded_chunk) = stripe[0];
+                if encoded_chunk.len() == 0 {
+                    return Ok(());
+                }
+
+                encoded_chunk.len()
+            };
+
+        let mut builder = ProtoBuilder::new_default();
+        let mut stripe_header = builder.init_root::<StripeHeaderBuilder>();
+
+        stripe_header.set_num_rows(num_rows as i32);
+
+        unimplemented!();
         Ok(())
     }
 }
@@ -258,18 +297,18 @@ impl fmt::Display for ColumnValue {
         }
 
         match *self {
-            ColumnValue::Null => write!(f, "(NULL)"),
-            ColumnValue::Byte(v) => write!(f, "Byte({})", v),
-            ColumnValue::Int32(v) => write!(f, "Int32({})", v),
-            ColumnValue::Int64(v) => write!(f, "Int64({})", v),
-            ColumnValue::Float(v) => write!(f, "Float({})", v),
+            ColumnValue::Null => { write!(f, "(NULL)"); },
+            ColumnValue::Byte(v) => { write!(f, "Byte({})", v); },
+            ColumnValue::Int32(v) => { write!(f, "Int32({})", v); },
+            ColumnValue::Int64(v) => { write!(f, "Int64({})", v); },
+            ColumnValue::Float(v) => { write!(f, "Float({})", v); },
             ColumnValue::FixedLength(ref v) => {
                 write!(f, "FixedLength(");
                 try!(write_bytes(f, &mut v.iter().take(5)));
                 if v.len() > 5 {
                     write!(f, "...");
                 }
-                write!(f, ")")
+                write!(f, ")");
             },
             ColumnValue::VariableLength(ref v) => {
                 write!(f, "VariableLength(");
@@ -284,7 +323,7 @@ impl fmt::Display for ColumnValue {
                         }
                     }
                 };
-                write!(f, ")")
+                write!(f, ")");
             }
         };
         Ok(())
@@ -591,14 +630,18 @@ impl ChunkGenerator for VariableLengthChunkGenerator {
     }
 }
 // ----------------------------------------------------------------------------
-pub struct StorageInserter {
-    storage: Arc<RwLock<Storage>>,
+pub struct StorageInserter<B>
+    where B: StorageBackend
+{
+    storage: Arc<RwLock<Storage<B>>>,
     enqueued_rows: Vec<Vec<ColumnValue>>,
     chunk_generators: Vec<Box<ChunkGenerator>>,
     max_rows_in_stripe: usize
 }
 
-impl StorageInserter {
+impl<B> StorageInserter<B>
+    where B: StorageBackend
+{
     fn get_chunk_generator_for_datatype(datatype: &ColumnDatatype, size: usize) -> Box<ChunkGenerator> {
         match *datatype {
             ColumnDatatype::Byte => Box::new(NumericChunkGenerator::<i8>::new(size)),
@@ -610,7 +653,7 @@ impl StorageInserter {
         }
     }
 
-    pub fn new(storage: Arc<RwLock<Storage>>) -> StorageInserter {
+    pub fn new(storage: Arc<RwLock<Storage<B>>>) -> StorageInserter<B> {
         let (max_rows_in_stripe, chunk_generators) = {
             // Acquire read lock
             let storage = storage.read().unwrap();
@@ -668,14 +711,28 @@ impl StorageInserter {
         {
             // Acquire write lock for storage
             let mut storage = self.storage.write().unwrap();
+            /*
             for chunk_generator in self.chunk_generators.iter_mut() {
                 {
                     let EncodedChunk(encoding, encoded_chunk) = chunk_generator.get_encoded_chunk();
 
                     // TODO: Write the format
-                    try!(storage.file.write(encoded_chunk));
+                    try!(storage.backend.write(encoded_chunk));
                 }
 
+                chunk_generator.reset();
+            }
+            */
+
+            {
+                let encoded_stripe: Vec<EncodedChunk> = self.chunk_generators.iter_mut()
+                    .map(|gen| gen.get_encoded_chunk())
+                    .collect();
+
+                try!(StorageFormat::append_stripe(&mut storage.backend, &encoded_stripe));
+            }
+
+            for chunk_generator in self.chunk_generators.iter_mut() {
                 chunk_generator.reset();
             }
 
@@ -687,7 +744,9 @@ impl StorageInserter {
     }
 }
 
-impl Drop for StorageInserter {
+impl<B> Drop for StorageInserter<B>
+    where B: StorageBackend
+{
     fn drop(&mut self) {
         self.flush().unwrap();
     }
@@ -699,10 +758,11 @@ mod test {
     use std::sync::{Arc, RwLock};
 
     use std::fs;
+    use std::fs::{File};
     use std::path::{Path, PathBuf};
 
     use ::os;
-    use ::storage::{Storage, ColumnDatatype, StorageInserter, ColumnValue};
+    use ::storage::{Storage, StorageBuilder, ColumnDatatype, StorageInserter, ColumnValue};
 
 
     struct TestPath {
@@ -736,8 +796,8 @@ mod test {
     struct TestStorage;
 
     impl TestStorage {
-        fn new(path: &Path) -> Storage {
-            Storage::build("test")
+        fn new(path: &Path) -> Storage<File> {
+            StorageBuilder::new()
                 .column("nullcol", ColumnDatatype::Byte)
                 .column("bytecol", ColumnDatatype::Byte)
                 .column("int32col", ColumnDatatype::Int32)
@@ -761,7 +821,7 @@ mod test {
     fn storage_can_be_built() {
         let test_path = TestPath::new();
 
-        Storage::build("test")
+        StorageBuilder::new()
             .column("id", ColumnDatatype::Int32)
             .at(test_path.file_name("test.storage"))
             .unwrap();
@@ -771,7 +831,7 @@ mod test {
     fn column_accessors() {
         let test_path = TestPath::new();
 
-        let storage = Storage::build("test")
+        let storage = StorageBuilder::new()
             .column("col1", ColumnDatatype::Int32)
             .column("col2", ColumnDatatype::Float)
             .at(test_path.file_name("test.storage")).unwrap();
@@ -785,17 +845,30 @@ mod test {
 
     #[test]
     fn storage_generates_right_columns() {
-        let test_path = TestPath::new();
-
-        Storage::build("test")
+        StorageBuilder::new()
             .column("col1", ColumnDatatype::Int32)
             .column("col2", ColumnDatatype::Int32)
-            .at(test_path.file_name("test.storage")).unwrap();
+            .in_memory()
+            .unwrap();
+    }
+
+    #[test]
+    fn storage_builder_in_valid_path() {
+        let mut test_path = TestPath::new();
+        let test_file = test_path.file_name("test.storage");
+        {
+            let builder = StorageBuilder::new()
+                .column("id", ColumnDatatype::Int32)
+                .at(&test_file);
+        }
+
+        // Check that the file exists
+        assert!(test_file.metadata().is_ok());
     }
 
     #[test]
     fn storage_builder_in_invalid_path() {
-        let builder = Storage::build("test") ;
+        let builder = StorageBuilder::new();
         assert!(builder.at("/invalid/path/test.storage").is_err());
         assert!(builder.at("/tmp").is_err());
         assert!(builder.at("/").is_err());
@@ -805,10 +878,10 @@ mod test {
     #[test]
     #[should_panic(expected="more than once")]
     fn storage_with_duplicated_columns() {
-        Storage::build("test")
+        StorageBuilder::new()
             .column("id", ColumnDatatype::Int32)
             .column("id", ColumnDatatype::Int64)
-            .at("/tmp/test.storage")
+            .in_memory()
             .unwrap();
     }
 
@@ -820,7 +893,7 @@ mod test {
 
         let mut storage = TestStorage::new(test_file.as_path());
 
-        let lock: Arc<RwLock<Storage>> = Arc::new(RwLock::new(storage));
+        let lock: Arc<RwLock<Storage<_>>> = Arc::new(RwLock::new(storage));
         {
             let mut inserter = StorageInserter::new(lock.clone());
 
@@ -852,7 +925,7 @@ mod test {
         let test_path = TestPath::new();
         let storage = TestStorage::new(test_path.file_name("test.storage").as_path());
 
-        let lock: Arc<RwLock<Storage>> = Arc::new(RwLock::new(storage));
+        let lock: Arc<RwLock<Storage<_>>> = Arc::new(RwLock::new(storage));
         {
             let mut inserter = StorageInserter::new(lock.clone());
 

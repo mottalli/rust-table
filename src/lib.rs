@@ -6,6 +6,6 @@ pub mod storage;
 mod test;
 mod os;
 
-mod table_capnp {
-    //include!(concat!(env!("OUT_DIR"), "/table_capnp.rs"));
+mod storage_capnp {
+    include!(concat!(env!("OUT_DIR"), "/storage_capnp.rs"));
 }

@@ -22,6 +22,7 @@ struct ColumnChunkHeader {
 struct StripeHeader {
     numRows @0: Int32;
     columnChunks @1 :List(ColumnChunkHeader);
+    stripe_size @2 :Int64;
 }
 
 struct Storage {
