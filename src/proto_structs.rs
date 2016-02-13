@@ -11,32 +11,24 @@ use ::encoding::Encoding;
 use ::compression::Compression;
 
 // ----------------------------------------------------------------------------
-trait ProtocolBuildable<'a> {
+pub trait ProtocolBuildable<'a> {
     type Builder: ::capnp::traits::FromPointerBuilder<'a>;
 
-    fn build_message(&self, builder: &'a mut Self::Builder);
-}
+    fn build_message(&self, builder: &mut Self::Builder);
 
-pub fn write_proto_struct<'a, W, B>(w: &mut W, builder: &'a mut ProtoBuilder<HeapAllocator>, object: &ProtocolBuildable<Builder=B>)
-    where W: io::Write,
-          B: ::capnp::traits::FromPointerBuilder<'a>
-{
-    let mut root_builder = builder.init_root::<B>();
-    object.build_message(&mut root_builder);
-    serialize::write_message(w, &builder);
-    Ok(())
-}
-// ----------------------------------------------------------------------------
-/*fn write_proto_struct<'a, W, B>(w: &mut W, b: &ProtocolBuildable<Builder=B>) -> io::Result<()>
-    where W: io::Write,
-          B: ::capnp::traits::FromPointerBuilder<'a>
-{
-    let mut builder = ProtoBuilder::new_default();
+    /* This is a lifetime hell and I can never get it right.
+    fn write_message<W>(&self, w: &mut W) -> io::Result<()>
+        where W: io::Write
     {
-        let mut root_builder = builder.init_root::<B>();
+        let mut builder = ProtoBuilder::new_default();
+        {
+            let mut header_builder: Self::Builder = builder.init_root::<Self::Builder>();
+            self.build_message(&mut header_builder);
+        }
+        ::capnp::serialize::write_message(w, &builder)
     }
+    */
 }
-*/
 
 // ----------------------------------------------------------------------------
 /// This is the translation of Capnp's structs to Rust.
@@ -52,6 +44,11 @@ pub struct StripeHeader {
     pub num_rows: usize,
     pub column_chunks: Vec<ColumnChunkHeader>,
     pub stripe_size: usize
+}
+
+pub struct Stripe {
+    pub absolute_offset: usize,
+    pub num_rows: usize
 }
 
 impl<'a> ProtocolBuildable<'a> for StripeHeader {

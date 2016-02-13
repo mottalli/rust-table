@@ -14,6 +14,7 @@ use std::slice;
 use capnp::message::{Builder as ProtoBuilder};
 
 use ::proto_structs;
+use ::proto_structs::ProtocolBuildable;
 use ::encoding::Encoding;
 use ::compression::Compression;
 
@@ -101,13 +102,15 @@ pub struct ColumnBuilder {
 pub trait StorageBackend : Read + Write + Seek {}
 impl StorageBackend for File {}
 impl StorageBackend for Cursor<Vec<u8>> {}
+impl<'a> StorageBackend for Cursor<&'a mut [u8]> {}
 
 // ----------------------------------------------------------------------------
 pub struct Storage
 {
     num_rows: usize,
     columns: Vec<Column>,
-    backend: Box<StorageBackend>
+    backend: Box<StorageBackend>,
+    stripes: Vec<proto_structs::Stripe>
 }
 
 impl Storage
@@ -126,7 +129,8 @@ impl Storage
         let mut storage = Storage {
             num_rows: 0,
             columns: Vec::new(),
-            backend: Box::new(backend)
+            backend: Box::new(backend),
+            stripes: Vec::new()
         };
 
         // Create the columns
@@ -172,57 +176,72 @@ impl Storage
         // No columns to insert? Weird...
         if stripe.len() == 0 { return Ok(()); }
 
+        // Compress the chunks
+        //TODO
+        let compressed_chunks: Vec<CompressedChunk> = stripe.iter()
+            .map(|&EncodedChunk(encoding, chunk)| CompressedChunk(Compression::None, encoding, chunk))
+            .collect();
+
+        // Calculate the size of the stripe. It is the sum of the sizes of the compressed chunks.
+        // We cannot do this because of issue #27739 :(
+        //let stripe_size: usize = compressed_chunks.iter().map(|&CompressedChunk(_, _, c)| c.len()).sum();
+        let stripe_size: usize = {
+            let mut stripe_size = 0;
+            for &CompressedChunk(_, _, c) in compressed_chunks.iter() {
+                stripe_size += c.len();
+            }
+            stripe_size
+        };
+
         let stripe_header_absolute_offset = self.current_offset();
 
         // Build the stripe header
         let mut stripe_header = proto_structs::StripeHeader {
             num_rows: num_rows,
             column_chunks: Vec::new(),
-            stripe_size: 0      // Will be calculated later
+            stripe_size: stripe_size
         };
 
         let mut relative_column_begin: usize = 0;
-        for &EncodedChunk(encoding, encoded_chunk) in stripe {
+        for (&CompressedChunk(compression, encoding, compressed_chunk), &EncodedChunk(_, encoded_chunk)) in compressed_chunks.iter().zip(stripe.iter()) {
             stripe_header.column_chunks.push(proto_structs::ColumnChunkHeader {
                 relative_offset: relative_column_begin,
-                compressed_size: encoded_chunk.len(),
+                compressed_size: compressed_chunk.len(),
                 uncompressed_size: encoded_chunk.len(),
                 encoding: encoding,
-                compression: Compression::None
+                compression: compression,
             });
+
+            relative_column_begin += compressed_chunk.len();
         }
 
-        /*let mut builder = ProtoBuilder::new_default();
-        let mut header_builder = builder.init_root::<proto_structs::StripeHeader::Builder>();*/
-
-        //try!(self.backend.write_protocol(&stripe_header));
-
-        /*{
+        // Write the stripe header
+        {
             let mut builder = ProtoBuilder::new_default();
-            let mut header_builder = builder.init_root::<StripeHeaderBuilder>();
-
-            header_builder.set_num_rows(num_rows as i32);
-            let mut column_chunks_builder = header_builder.init_column_chunks(stripe.len() as u32);
-
-            // Points to the offset of the next column relative to the beginning of the
-            // stripe
-            let mut relative_column_begin: usize = 0;
-            for (c, &EncodedChunk(encoding, encodedChunk)) in stripe.iter().enumerate() {
-                let mut column_chunk_builder = column_chunks_builder.borrow().get(c as u32);
-                column_chunk_builder.set_relative_offset(relative_column_begin as i64);
-                relative_column_begin += encodedChunk.len();
+            {
+                let mut header_builder = builder.init_root::<<proto_structs::StripeHeader as proto_structs::ProtocolBuildable>::Builder>();
+                stripe_header.build_message(&mut header_builder);
             }
-        }*/
+            try!(::capnp::serialize::write_message(&mut self.backend, &builder));
+        }
 
-        unimplemented!();
+        // Now write all the compressed columns
+        for &CompressedChunk(_, _, chunk) in compressed_chunks.iter() {
+            self.backend.write(chunk);
+        }
+
+        self.stripes.push(proto_structs::Stripe {
+            absolute_offset: stripe_header_absolute_offset,
+            num_rows: num_rows
+        });
 
         self.num_rows += num_rows;
 
         Ok(())
     }
 
-    fn current_offset(&mut self) -> u64 {
-        self.backend.seek(io::SeekFrom::Current(0)).unwrap()
+    fn current_offset(&mut self) -> usize {
+        self.backend.seek(io::SeekFrom::Current(0)).unwrap() as usize
     }
 }
 
@@ -300,6 +319,10 @@ impl StorageBuilder {
     pub fn in_memory(&self) -> StorageResult<Storage> {
         let mem_backend = Cursor::new(Vec::<u8>::new());
         Storage::init(mem_backend, self)
+    }
+
+    pub fn using_backend<B: StorageBackend + 'static>(&self, backend: B) -> StorageResult<Storage> {
+        Storage::init(backend, self)
     }
 }
 
@@ -433,6 +456,7 @@ impl NumericValue for f32 {
 
 // ----------------------------------------------------------------------------
 pub struct EncodedChunk<'a>(pub Encoding, pub &'a [u8]);
+pub struct CompressedChunk<'a>(pub Compression, pub Encoding, pub &'a [u8]);
 
 trait ChunkGenerator {
     fn validate_value(&self, value: &ColumnValue) -> StorageResult<()>;
@@ -714,6 +738,7 @@ mod test {
     use std::fs;
     use std::fs::{File};
     use std::path::{Path, PathBuf};
+    use std::io::Cursor;
 
     use ::os;
     use ::storage::{Storage, StorageBuilder, ColumnDatatype, StorageInserter, ColumnValue};
@@ -838,6 +863,20 @@ mod test {
             .in_memory()
             .unwrap();
     }
+
+    /*fn storage_with_custom_backend() {
+        let memory = Vec::<u8>::new();
+        {
+            let memory_backend = Cursor::new(&mut memory[..]);
+
+            StorageBuilder::new()
+                .column("id", ColumnDatatype::Int32)
+                .column("id", ColumnDatatype::Int64)
+                .using_backend(memory_backend)
+                .unwrap();
+        }
+        assert_eq!(memory.len(), 0);
+    }*/
 
     #[test]
     fn a_single_row_can_be_inserted() {
