@@ -12,17 +12,17 @@ enum Compression {
 }
 
 struct ColumnChunkHeader {
-    relativeOffset @0 :Int64;
-    compressedSize @1 :Int32;
-    uncompressedSize @2 :Int32;
+    relativeOffset @0 :UInt64;
+    compressedSize @1 :UInt32;
+    uncompressedSize @2 :UInt32;
     encoding @3 :Encoding;
     compression @4 :Compression;
 }
 
 struct StripeHeader {
-    numRows @0: Int32;
+    numRows @0: UInt32;
     columnChunks @1 :List(ColumnChunkHeader);
-    stripeSize @2 :Int64;
+    stripeSize @2 :UInt64;
 }
 
 struct Storage {
@@ -33,18 +33,8 @@ struct Storage {
     metadata @4 :List(Metadata);
 
     struct Stripe {
-        absoluteOffset @0 :Int64;
-        numRows @1 :Int64;
-    }
-
-    struct ColumnChunk {
-        encoding @0 :Encoding;
-        compression @1 :Compression;
-    }
-
-    struct SortColumn {
-        columnIdx @0 :Int32;
-        ascending @1 :Bool = true;
+        absoluteOffset @0 :UInt64;
+        numRows @1 :UInt64;
     }
 
     struct Metadata {
@@ -57,23 +47,16 @@ struct Storage {
         type @1 :ColumnType;
 
         # Only for type = fixed_len
-        size @2 :Int32 = 0;
-
-        nullable @3 :Bool = true;
-        primaryKey @4 :Bool = false;
-        indexed @5 :Bool = false;
-
-        metadata @6 :List(Metadata);
+        valueSize @2 :Int32 = 0;
 
         enum ColumnType {
-            boolean @0;
-            byte @1;
-            int32 @2;
-            int64 @3;
-            float @4;
-            double @5;
-            utf8 @6;
-            fixedLen @7;
+            byte @0;
+            int32 @1;
+            int64 @2;
+            float @3;
+            double @4;
+            fixedLength @5;
+            variableLength @6;
         }
     }
 }

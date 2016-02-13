@@ -11,9 +11,11 @@ use std::{i8, i32, i64, f32};
 use std::mem;
 use std::slice;
 
-use ::storage_capnp::stripe_header::Builder as StripeHeaderBuilder;
-use capnp::serialize_packed;
-use capnp::message::Builder as ProtoBuilder;
+use capnp::message::{Builder as ProtoBuilder};
+
+use ::proto_structs;
+use ::encoding::Encoding;
+use ::compression::Compression;
 
 // ----------------------------------------------------------------------------
 /// Helper function
@@ -101,18 +103,16 @@ impl StorageBackend for File {}
 impl StorageBackend for Cursor<Vec<u8>> {}
 
 // ----------------------------------------------------------------------------
-pub struct Storage<Backend>
-    where Backend: StorageBackend
+pub struct Storage
 {
     num_rows: usize,
     columns: Vec<Column>,
-    backend: Backend
+    backend: Box<StorageBackend>
 }
 
-impl<Backend> Storage<Backend>
-    where Backend: StorageBackend
+impl Storage
 {
-    fn init(backend: Backend, builder: &StorageBuilder) -> StorageResult<Storage<Backend>> {
+    fn init<B: StorageBackend + 'static>(backend: B, builder: &StorageBuilder) -> StorageResult<Storage> {
         // Make sure the column names are not duplicated
         let mut name_count: HashMap<&str, i32> = HashMap::new();
         for ref column in builder.columns.iter() {
@@ -126,7 +126,7 @@ impl<Backend> Storage<Backend>
         let mut storage = Storage {
             num_rows: 0,
             columns: Vec::new(),
-            backend: backend
+            backend: Box::new(backend)
         };
 
         // Create the columns
@@ -140,8 +140,6 @@ impl<Backend> Storage<Backend>
 
             storage.columns.push(column);
         }
-
-        try!(StorageFormat::write_header(&mut storage.backend));
 
         Ok(storage)
     }
@@ -169,10 +167,64 @@ impl<Backend> Storage<Backend>
 
         (blocks_in_stripe*disk_block_size) / max_size
     }
-}
 
-pub type DiskStorage = Storage<File>;
-pub type MemoryStorage = Storage<Cursor<Vec<u8>>>;
+    fn append_stripe(&mut self, num_rows: usize, stripe: &Vec<EncodedChunk>) -> StorageResult<()> {
+        // No columns to insert? Weird...
+        if stripe.len() == 0 { return Ok(()); }
+
+        let stripe_header_absolute_offset = self.current_offset();
+
+        // Build the stripe header
+        let mut stripe_header = proto_structs::StripeHeader {
+            num_rows: num_rows,
+            column_chunks: Vec::new(),
+            stripe_size: 0      // Will be calculated later
+        };
+
+        let mut relative_column_begin: usize = 0;
+        for &EncodedChunk(encoding, encoded_chunk) in stripe {
+            stripe_header.column_chunks.push(proto_structs::ColumnChunkHeader {
+                relative_offset: relative_column_begin,
+                compressed_size: encoded_chunk.len(),
+                uncompressed_size: encoded_chunk.len(),
+                encoding: encoding,
+                compression: Compression::None
+            });
+        }
+
+        /*let mut builder = ProtoBuilder::new_default();
+        let mut header_builder = builder.init_root::<proto_structs::StripeHeader::Builder>();*/
+
+        //try!(self.backend.write_protocol(&stripe_header));
+
+        /*{
+            let mut builder = ProtoBuilder::new_default();
+            let mut header_builder = builder.init_root::<StripeHeaderBuilder>();
+
+            header_builder.set_num_rows(num_rows as i32);
+            let mut column_chunks_builder = header_builder.init_column_chunks(stripe.len() as u32);
+
+            // Points to the offset of the next column relative to the beginning of the
+            // stripe
+            let mut relative_column_begin: usize = 0;
+            for (c, &EncodedChunk(encoding, encodedChunk)) in stripe.iter().enumerate() {
+                let mut column_chunk_builder = column_chunks_builder.borrow().get(c as u32);
+                column_chunk_builder.set_relative_offset(relative_column_begin as i64);
+                relative_column_begin += encodedChunk.len();
+            }
+        }*/
+
+        unimplemented!();
+
+        self.num_rows += num_rows;
+
+        Ok(())
+    }
+
+    fn current_offset(&mut self) -> u64 {
+        self.backend.seek(io::SeekFrom::Current(0)).unwrap()
+    }
+}
 
 // ----------------------------------------------------------------------------
 #[derive(Debug)]
@@ -180,7 +232,10 @@ pub enum StorageError {
     FileAlreadyExists,
     InvalidPath(PathBuf),
     InvalidFormat(String),
-    IoError(io::Error)
+    IoError(io::Error),
+    InvalidNumberOfColumns(usize, usize),
+    TypeError,
+    InvalidLength(usize, usize)
 }
 
 /*impl fmt::Debug for StorageError {
@@ -209,13 +264,14 @@ impl StorageBuilder {
     fn new() -> StorageBuilder {
         StorageBuilder { columns: Vec::new() }
     }
+
     pub fn column(&mut self, name: &str, datatype: ColumnDatatype) -> &mut Self {
         self.columns.push(Column::build(name, datatype));
         self
     }
 
     /// Creates the storage at the specified path
-    pub fn at<P: AsRef<Path>>(&self, path_ref: P) -> StorageResult<DiskStorage> {
+    pub fn at<P: AsRef<Path>>(&self, path_ref: P) -> StorageResult<Storage> {
         let path = path_ref.as_ref();
 
         // Check that the file does NOT exist
@@ -241,41 +297,12 @@ impl StorageBuilder {
         Storage::init(file, self)
     }
 
-    pub fn in_memory(&self) -> StorageResult<MemoryStorage> {
+    pub fn in_memory(&self) -> StorageResult<Storage> {
         let mem_backend = Cursor::new(Vec::<u8>::new());
         Storage::init(mem_backend, self)
     }
 }
 
-// ----------------------------------------------------------------------------
-struct StorageFormat;
-impl StorageFormat {
-    fn write_header(backend: &mut StorageBackend) -> io::Result<()> {
-        try!(backend.write("SCF".as_bytes()));
-        Ok(())
-    }
-
-    fn append_stripe(backend: &mut StorageBackend, stripe: &Vec<EncodedChunk>) -> io::Result<()> {
-        let num_rows = if stripe.len() == 0 {
-                return Ok(());
-            } else {
-                let EncodedChunk(encoding, encoded_chunk) = stripe[0];
-                if encoded_chunk.len() == 0 {
-                    return Ok(());
-                }
-
-                encoded_chunk.len()
-            };
-
-        let mut builder = ProtoBuilder::new_default();
-        let mut stripe_header = builder.init_root::<StripeHeaderBuilder>();
-
-        stripe_header.set_num_rows(num_rows as i32);
-
-        unimplemented!();
-        Ok(())
-    }
-}
 
 // ----------------------------------------------------------------------------
 #[derive(Debug, Clone)]
@@ -331,52 +358,6 @@ impl fmt::Display for ColumnValue {
 }
 
 // ----------------------------------------------------------------------------
-#[derive(Debug)]
-pub enum InsertError {
-    InvalidNumberOfColumns(usize, usize),
-    IoError(io::Error),
-    ValueError(ValueError)
-}
-
-/*
-impl fmt::Debug for InsertError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
-            InsertError::InvalidNumberOfColumns(got, expected) => write!(f, "Invalid number of columns: Got {}, expected {}", got, expected),
-            InsertError::IoError(ref e) => e.fmt(f),
-            InsertError::ValueError(ref e) => e.fmt(f),
-        }
-    }
-}*/
-
-impl From<ValueError> for InsertError {
-    fn from(err: ValueError) -> InsertError { InsertError::ValueError(err) }
-}
-
-impl From<io::Error> for InsertError {
-    fn from(err: io::Error) -> InsertError { InsertError::IoError(err) }
-}
-
-pub type InsertResult<T> = Result<T, InsertError>;
-
-// ----------------------------------------------------------------------------
-#[derive(Debug)]
-pub enum ValueError {
-    TypeError,
-    InvalidLength(usize, usize)
-}
-
-/*
-impl fmt::Debug for ValueError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
-            ValueError::TypeError(value, expected_type) => write!(f, "Wrong type for value: Got {}, expected {}", value, expected_type)
-        }
-    }
-}
-*/
-
-// ----------------------------------------------------------------------------
 trait NumericValue: Sized {
     /// Extract exactly a value of this type from the given value.
     /// It should not handle NULL cases, this is done by extract_value_or_null
@@ -388,7 +369,7 @@ trait NumericValue: Sized {
 
     /// Extract a value of this type or the NULL value. Returns an error
     /// if the value is not NULL or it is not of this type.
-    fn extract_value_or_null(value: &ColumnValue) -> Result<Option<Self>, ValueError> {
+    fn extract_value_or_null(value: &ColumnValue) -> StorageResult<Option<Self>> {
         if let ColumnValue::Null = *value {
             // Return "No value"
             return Ok(None)
@@ -397,7 +378,7 @@ trait NumericValue: Sized {
         match Self::extract_value_exact(value) {
             Some(v) => Ok(Some(v)),
             None => // The value could not be extracted
-                Err(ValueError::TypeError)
+                Err(StorageError::TypeError)
         }
     }
 }
@@ -451,20 +432,10 @@ impl NumericValue for f32 {
 }
 
 // ----------------------------------------------------------------------------
-#[derive(Copy, Clone)]
-enum ChunkEncoding {
-    None, RLE, DeltaEncoding
-}
-
-#[derive(Copy, Clone)]
-enum ChunkCompression {
-    None, Snappy
-}
-
-struct EncodedChunk<'a>(ChunkEncoding, &'a [u8]);
+pub struct EncodedChunk<'a>(pub Encoding, pub &'a [u8]);
 
 trait ChunkGenerator {
-    fn validate_value(&self, value: &ColumnValue) -> InsertResult<()>;
+    fn validate_value(&self, value: &ColumnValue) -> StorageResult<()>;
     fn get_encoded_chunk<'a>(&'a mut self) -> EncodedChunk<'a>;
     fn reset(&mut self);
 
@@ -487,7 +458,7 @@ impl<N> NumericChunkGenerator<N> {
 impl<N> ChunkGenerator for NumericChunkGenerator<N>
     where N: NumericValue
 {
-    fn validate_value(&self, value: &ColumnValue) -> InsertResult<()> {
+    fn validate_value(&self, value: &ColumnValue) -> StorageResult<()> {
         try!(N::extract_value_or_null(value));
         Ok(())
     }
@@ -504,7 +475,7 @@ impl<N> ChunkGenerator for NumericChunkGenerator<N>
 
     fn get_encoded_chunk<'a>(&'a mut self) -> EncodedChunk<'a> {
         let result = get_slice_bytes(&self.values);
-        EncodedChunk(ChunkEncoding::None, result)
+        EncodedChunk(Encoding::Raw, result)
     }
 
     fn reset(&mut self) {
@@ -532,17 +503,17 @@ impl FixedLengthChunkGenerator {
 }
 
 impl ChunkGenerator for FixedLengthChunkGenerator {
-    fn validate_value(&self, value: &ColumnValue) -> InsertResult<()> {
+    fn validate_value(&self, value: &ColumnValue) -> StorageResult<()> {
         match *value {
             ColumnValue::Null => Ok(()),
             ColumnValue::FixedLength(ref v) => {
                 if v.len() == self.value_size {
                     Ok(())
                 } else {
-                    Err(InsertError::ValueError(ValueError::InvalidLength(v.len(), self.value_size)))
+                    Err(StorageError::InvalidLength(v.len(), self.value_size))
                 }
             },
-            _ => Err(InsertError::ValueError(ValueError::TypeError))
+            _ => Err(StorageError::TypeError)
         }
     }
 
@@ -567,7 +538,7 @@ impl ChunkGenerator for FixedLengthChunkGenerator {
         self.encoded_chunk_buffer.write(&nulls);
         self.encoded_chunk_buffer.write(&self.values);
 
-        EncodedChunk(ChunkEncoding::None, &self.encoded_chunk_buffer)
+        EncodedChunk(Encoding::Raw, &self.encoded_chunk_buffer)
     }
 
     fn reset(&mut self) {
@@ -594,11 +565,11 @@ impl VariableLengthChunkGenerator {
 }
 
 impl ChunkGenerator for VariableLengthChunkGenerator {
-    fn validate_value(&self, value: &ColumnValue) -> InsertResult<()> {
+    fn validate_value(&self, value: &ColumnValue) -> StorageResult<()> {
         match *value {
             ColumnValue::Null => Ok(()),
             ColumnValue::VariableLength(_) => Ok(()),
-            _ => Err(InsertError::ValueError(ValueError::TypeError))
+            _ => Err(StorageError::TypeError)
         }
     }
 
@@ -621,7 +592,7 @@ impl ChunkGenerator for VariableLengthChunkGenerator {
         self.encoded_chunk_buffer.write(get_slice_bytes(&self.sizes));
         self.encoded_chunk_buffer.write(&self.values);
 
-        EncodedChunk(ChunkEncoding::None, &self.encoded_chunk_buffer)
+        EncodedChunk(Encoding::Raw, &self.encoded_chunk_buffer)
     }
 
     fn reset(&mut self) {
@@ -630,17 +601,15 @@ impl ChunkGenerator for VariableLengthChunkGenerator {
     }
 }
 // ----------------------------------------------------------------------------
-pub struct StorageInserter<B>
-    where B: StorageBackend
+pub struct StorageInserter
 {
-    storage: Arc<RwLock<Storage<B>>>,
+    storage: Arc<RwLock<Storage>>,
     enqueued_rows: Vec<Vec<ColumnValue>>,
     chunk_generators: Vec<Box<ChunkGenerator>>,
     max_rows_in_stripe: usize
 }
 
-impl<B> StorageInserter<B>
-    where B: StorageBackend
+impl StorageInserter
 {
     fn get_chunk_generator_for_datatype(datatype: &ColumnDatatype, size: usize) -> Box<ChunkGenerator> {
         match *datatype {
@@ -653,7 +622,7 @@ impl<B> StorageInserter<B>
         }
     }
 
-    pub fn new(storage: Arc<RwLock<Storage<B>>>) -> StorageInserter<B> {
+    pub fn new(storage: Arc<RwLock<Storage>>) -> StorageInserter {
         let (max_rows_in_stripe, chunk_generators) = {
             // Acquire read lock
             let storage = storage.read().unwrap();
@@ -674,12 +643,12 @@ impl<B> StorageInserter<B>
         }
     }
 
-    pub fn enqueue_row(&mut self, row: &Vec<ColumnValue>) -> InsertResult<()> {
+    pub fn enqueue_row(&mut self, row: &Vec<ColumnValue>) -> StorageResult<()> {
         // Validate number of columns
         let expected = self.storage.read().unwrap().num_columns();
         let got = row.len();
         if got != expected {
-            return Err(InsertError::InvalidNumberOfColumns(got, expected))
+            return Err(StorageError::InvalidNumberOfColumns(got, expected))
         }
 
         // Make sure that all the values have the right types
@@ -696,7 +665,7 @@ impl<B> StorageInserter<B>
         }
     }
 
-    fn flush(&mut self) -> InsertResult<()> {
+    fn flush(&mut self) -> StorageResult<()> {
         if self.enqueued_rows.len() == 0 {
             return Ok(())
         }
@@ -711,32 +680,18 @@ impl<B> StorageInserter<B>
         {
             // Acquire write lock for storage
             let mut storage = self.storage.write().unwrap();
-            /*
-            for chunk_generator in self.chunk_generators.iter_mut() {
-                {
-                    let EncodedChunk(encoding, encoded_chunk) = chunk_generator.get_encoded_chunk();
-
-                    // TODO: Write the format
-                    try!(storage.backend.write(encoded_chunk));
-                }
-
-                chunk_generator.reset();
-            }
-            */
 
             {
                 let encoded_stripe: Vec<EncodedChunk> = self.chunk_generators.iter_mut()
                     .map(|gen| gen.get_encoded_chunk())
                     .collect();
 
-                try!(StorageFormat::append_stripe(&mut storage.backend, &encoded_stripe));
+                try!(storage.append_stripe(self.enqueued_rows.len(), &encoded_stripe));
             }
 
             for chunk_generator in self.chunk_generators.iter_mut() {
                 chunk_generator.reset();
             }
-
-            storage.num_rows += self.enqueued_rows.len();
         }
 
         self.enqueued_rows.clear();
@@ -744,8 +699,7 @@ impl<B> StorageInserter<B>
     }
 }
 
-impl<B> Drop for StorageInserter<B>
-    where B: StorageBackend
+impl Drop for StorageInserter
 {
     fn drop(&mut self) {
         self.flush().unwrap();
@@ -796,7 +750,7 @@ mod test {
     struct TestStorage;
 
     impl TestStorage {
-        fn new(path: &Path) -> Storage<File> {
+        fn new(path: &Path) -> Storage {
             StorageBuilder::new()
                 .column("nullcol", ColumnDatatype::Byte)
                 .column("bytecol", ColumnDatatype::Byte)
@@ -893,7 +847,7 @@ mod test {
 
         let mut storage = TestStorage::new(test_file.as_path());
 
-        let lock: Arc<RwLock<Storage<_>>> = Arc::new(RwLock::new(storage));
+        let lock: Arc<RwLock<Storage>> = Arc::new(RwLock::new(storage));
         {
             let mut inserter = StorageInserter::new(lock.clone());
 
@@ -925,7 +879,7 @@ mod test {
         let test_path = TestPath::new();
         let storage = TestStorage::new(test_path.file_name("test.storage").as_path());
 
-        let lock: Arc<RwLock<Storage<_>>> = Arc::new(RwLock::new(storage));
+        let lock: Arc<RwLock<Storage>> = Arc::new(RwLock::new(storage));
         {
             let mut inserter = StorageInserter::new(lock.clone());
 
