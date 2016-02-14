@@ -102,7 +102,6 @@ pub struct ColumnBuilder {
 pub trait StorageBackend : Read + Write + Seek {}
 impl StorageBackend for File {}
 impl StorageBackend for Cursor<Vec<u8>> {}
-impl<'a> StorageBackend for Cursor<&'a mut [u8]> {}
 
 // ----------------------------------------------------------------------------
 pub struct Storage
@@ -319,10 +318,6 @@ impl StorageBuilder {
     pub fn in_memory(&self) -> StorageResult<Storage> {
         let mem_backend = Cursor::new(Vec::<u8>::new());
         Storage::init(mem_backend, self)
-    }
-
-    pub fn using_backend<B: StorageBackend + 'static>(&self, backend: B) -> StorageResult<Storage> {
-        Storage::init(backend, self)
     }
 }
 
@@ -863,20 +858,6 @@ mod test {
             .in_memory()
             .unwrap();
     }
-
-    /*fn storage_with_custom_backend() {
-        let memory = Vec::<u8>::new();
-        {
-            let memory_backend = Cursor::new(&mut memory[..]);
-
-            StorageBuilder::new()
-                .column("id", ColumnDatatype::Int32)
-                .column("id", ColumnDatatype::Int64)
-                .using_backend(memory_backend)
-                .unwrap();
-        }
-        assert_eq!(memory.len(), 0);
-    }*/
 
     #[test]
     fn a_single_row_can_be_inserted() {
