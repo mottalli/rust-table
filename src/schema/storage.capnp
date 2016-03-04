@@ -25,7 +25,7 @@ struct StripeHeader {
     stripeSize @2 :UInt64;
 }
 
-struct Storage {
+struct StorageFooter {
     version @0 :Int16;
     numRows @1 :Int64;
     columns @2 :List(Column);
@@ -54,9 +54,8 @@ struct Storage {
             int32 @1;
             int64 @2;
             float @3;
-            double @4;
-            fixedLength @5;
-            variableLength @6;
+            fixedLength @4;
+            variableLength @5;
         }
     }
 }

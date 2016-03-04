@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::io;
-use std::io::{Read, Write, Seek, Cursor};
+use std::io::{Read, Write, Seek, SeekFrom, Cursor};
 use std::fmt;
 use std::collections::hash_map::HashMap;
 use std::sync::{Arc, RwLock};
@@ -114,7 +114,7 @@ pub struct Storage
 
 impl Storage
 {
-    fn init<B: StorageBackend + 'static>(backend: B, builder: &StorageBuilder) -> StorageResult<Storage> {
+    fn init(backend: Box<StorageBackend>, builder: &StorageBuilder) -> StorageResult<Storage> {
         // Make sure the column names are not duplicated
         let mut name_count: HashMap<&str, i32> = HashMap::new();
         for ref column in builder.columns.iter() {
@@ -125,26 +125,42 @@ impl Storage
             }
         }
 
+        // Create the columns
+        let columns: Vec<Column> = builder.columns.iter().enumerate().map(|(i,b)| {
+            Column {
+                name: b.name.clone(),
+                datatype: b.datatype,
+                datatype_info: DatatypeInfo::new(&b.datatype),
+                num_column: i
+            }
+        }).collect();
+
         let mut storage = Storage {
             num_rows: 0,
-            columns: Vec::new(),
-            backend: Box::new(backend),
+            columns: columns,
+            backend: backend,
             stripes: Vec::new()
         };
 
-        // Create the columns
-        for ref column_builder in &builder.columns {
-            let column = Column {
-                name: column_builder.name.clone(),
-                datatype: column_builder.datatype,
-                datatype_info: DatatypeInfo::new(&column_builder.datatype),
-                num_column: storage.columns.len()
-            };
-
-            storage.columns.push(column);
-        }
+        try!(storage.write_header());
 
         Ok(storage)
+    }
+
+    fn write_header(&mut self) -> StorageResult<()> {
+        try!(self.backend.write(Self::signature()));
+        Ok(())
+    }
+
+    fn write_footer(&mut self) -> StorageResult<()> {
+        try!(self.backend.seek(SeekFrom::End(0)));
+        try!(self.backend.write(Self::signature()));
+        Ok(())
+    }
+
+    fn signature() -> &'static [u8] {
+        // "Snel Columnar Storage"
+        "SCS".as_bytes()
     }
 
     pub fn columns(&self) -> &Vec<Column> { &self.columns }
@@ -153,7 +169,6 @@ impl Storage
         self.columns.iter().find(|ref c| c.name == name)
     }
     pub fn num_columns(&self) -> usize { self.columns.len() }
-
     pub fn num_rows(&self) -> usize { self.num_rows }
 
     /// A hint for how many rows should fit in a storage stripe
@@ -169,6 +184,10 @@ impl Storage
             .max().unwrap_or(1);    // If there are no numeric colums, assume size 1
 
         (blocks_in_stripe*disk_block_size) / max_size
+    }
+
+    fn begin_inserting(self) -> InsertionManager {
+        InsertionManager::new(self)
     }
 
     fn append_stripe(&mut self, num_rows: usize, stripe: &Vec<EncodedChunk>) -> StorageResult<()> {
@@ -312,12 +331,12 @@ impl StorageBuilder {
         // Create the file that will hold this storage
         let file = try!(File::create(&path_ref));
 
-        Storage::init(file, self)
+        Storage::init(Box::new(file), self)
     }
 
     pub fn in_memory(&self) -> StorageResult<Storage> {
         let mem_backend = Cursor::new(Vec::<u8>::new());
-        Storage::init(mem_backend, self)
+        Storage::init(Box::new(mem_backend), self)
     }
 }
 
@@ -619,6 +638,35 @@ impl ChunkGenerator for VariableLengthChunkGenerator {
         self.values.clear();
     }
 }
+
+// ----------------------------------------------------------------------------
+/// Responsible for creating several instances of StorageInserter.
+/// This allows us to insert rows concurrently into a storage.
+pub struct InsertionManager {
+    storage_lock: Arc<RwLock<Storage>>
+}
+
+impl InsertionManager {
+    fn new(storage: Storage) -> InsertionManager {
+        InsertionManager {
+            storage_lock: Arc::new(RwLock::new(storage))
+        }
+    }
+
+    pub fn create_inserter(&mut self) -> StorageInserter {
+        StorageInserter::new(self.storage_lock.clone())
+    }
+
+    pub fn finish_inserting(mut self) -> StorageResult<Storage> {
+        let mut storage = Arc::try_unwrap(self.storage_lock)
+            .ok().expect("Tried to finish inserting rows while there are pending insertions")
+            .into_inner().unwrap();
+
+        try!(storage.write_footer());
+        Ok(storage)
+    }
+}
+
 // ----------------------------------------------------------------------------
 pub struct StorageInserter
 {
@@ -630,18 +678,7 @@ pub struct StorageInserter
 
 impl StorageInserter
 {
-    fn get_chunk_generator_for_datatype(datatype: &ColumnDatatype, size: usize) -> Box<ChunkGenerator> {
-        match *datatype {
-            ColumnDatatype::Byte => Box::new(NumericChunkGenerator::<i8>::new(size)),
-            ColumnDatatype::Int32 => Box::new(NumericChunkGenerator::<i32>::new(size)),
-            ColumnDatatype::Int64 => Box::new(NumericChunkGenerator::<i64>::new(size)),
-            ColumnDatatype::Float => Box::new(NumericChunkGenerator::<f32>::new(size)),
-            ColumnDatatype::FixedLength(length) => Box::new(FixedLengthChunkGenerator::new(length, size)),
-            ColumnDatatype::VariableLength => Box::new(VariableLengthChunkGenerator::new(size)),
-        }
-    }
-
-    pub fn new(storage: Arc<RwLock<Storage>>) -> StorageInserter {
+    fn new(storage: Arc<RwLock<Storage>>) -> StorageInserter {
         let (max_rows_in_stripe, chunk_generators) = {
             // Acquire read lock
             let storage = storage.read().unwrap();
@@ -659,6 +696,17 @@ impl StorageInserter
             enqueued_rows: Vec::new(),
             chunk_generators: chunk_generators,
             max_rows_in_stripe: max_rows_in_stripe,
+        }
+    }
+
+    fn get_chunk_generator_for_datatype(datatype: &ColumnDatatype, size: usize) -> Box<ChunkGenerator> {
+        match *datatype {
+            ColumnDatatype::Byte => Box::new(NumericChunkGenerator::<i8>::new(size)),
+            ColumnDatatype::Int32 => Box::new(NumericChunkGenerator::<i32>::new(size)),
+            ColumnDatatype::Int64 => Box::new(NumericChunkGenerator::<i64>::new(size)),
+            ColumnDatatype::Float => Box::new(NumericChunkGenerator::<f32>::new(size)),
+            ColumnDatatype::FixedLength(length) => Box::new(FixedLengthChunkGenerator::new(length, size)),
+            ColumnDatatype::VariableLength => Box::new(VariableLengthChunkGenerator::new(size)),
         }
     }
 
@@ -733,11 +781,10 @@ mod test {
     use std::fs;
     use std::fs::{File};
     use std::path::{Path, PathBuf};
-    use std::io::Cursor;
+    use std::io::{Cursor, Read, Seek, SeekFrom};
 
     use ::os;
     use ::storage::{Storage, StorageBuilder, ColumnDatatype, StorageInserter, ColumnValue};
-
 
     struct TestPath {
         path: PathBuf,
@@ -792,13 +839,28 @@ mod test {
     }
 
     #[test]
-    fn storage_can_be_built() {
+    fn storage_can_be_initialized() {
         let test_path = TestPath::new();
+        let filename = test_path.file_name("test.storage");
 
         StorageBuilder::new()
             .column("id", ColumnDatatype::Int32)
-            .at(test_path.file_name("test.storage"))
+            .at(&filename)
             .unwrap();
+
+        // Check that the file has the right header and footer
+        let mut file = File::open(&filename).unwrap();
+        let expected_signature = Storage::signature();
+        let mut buf = Vec::<u8>::new();
+        buf.resize(expected_signature.len(), 0);
+
+        file.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf[..], expected_signature);
+
+        // Check the footer
+        file.seek(SeekFrom::End(-(expected_signature.len() as i64)));
+        file.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf[..], expected_signature);
     }
 
     #[test]
@@ -866,10 +928,9 @@ mod test {
         let test_file = test_path.file_name("test.storage");
 
         let mut storage = TestStorage::new(test_file.as_path());
-
-        let lock: Arc<RwLock<Storage>> = Arc::new(RwLock::new(storage));
+        let mut insertion_manager = storage.begin_inserting();
         {
-            let mut inserter = StorageInserter::new(lock.clone());
+            let mut inserter = insertion_manager.create_inserter();
 
             let row = vec!(
                 ColumnValue::Null,
@@ -885,11 +946,7 @@ mod test {
             assert!(result.is_ok());
         }
 
-        // Get the Storage outside the Mutex outside the Arc
-        // Inception!
-        storage = Arc::try_unwrap(lock).ok().unwrap()
-            .into_inner().unwrap();
-
+        storage = insertion_manager.finish_inserting().unwrap();
         assert_eq!(storage.num_rows(), 1);
 
     }
@@ -897,11 +954,11 @@ mod test {
     #[test]
     fn invalid_values_cannot_be_inserted() {
         let test_path = TestPath::new();
-        let storage = TestStorage::new(test_path.file_name("test.storage").as_path());
 
-        let lock: Arc<RwLock<Storage>> = Arc::new(RwLock::new(storage));
+        let storage = TestStorage::new(test_path.file_name("test.storage").as_path());
+        let mut insertion_manager = storage.begin_inserting();
         {
-            let mut inserter = StorageInserter::new(lock.clone());
+            let mut inserter = insertion_manager.create_inserter();
 
             let row = vec!(
                 ColumnValue::Null,
