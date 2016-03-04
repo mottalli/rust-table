@@ -54,18 +54,18 @@ impl fmt::Display for ColumnDatatype {
 struct DatatypeInfo {
     is_numeric: bool,
     is_fixed_size: bool,
-    value_size: usize
+    value_size: Option<usize>
 }
 
 impl DatatypeInfo {
     fn new(datatype: &ColumnDatatype) -> DatatypeInfo {
         match *datatype {
-            ColumnDatatype::Byte => DatatypeInfo { is_numeric: true, is_fixed_size: true, value_size: 1 },
-            ColumnDatatype::Int32 => DatatypeInfo { is_numeric: true, is_fixed_size: true, value_size: 4 },
-            ColumnDatatype::Int64 => DatatypeInfo { is_numeric: true, is_fixed_size: true, value_size: 8 },
-            ColumnDatatype::Float => DatatypeInfo { is_numeric: true, is_fixed_size: true, value_size: 4 },
-            ColumnDatatype::FixedLength(s) => DatatypeInfo { is_numeric: false, is_fixed_size: true, value_size: s as usize },
-            ColumnDatatype::VariableLength => DatatypeInfo { is_numeric: false, is_fixed_size: false, value_size: 0 },
+            ColumnDatatype::Byte => DatatypeInfo { is_numeric: true, is_fixed_size: true, value_size: Some(1) },
+            ColumnDatatype::Int32 => DatatypeInfo { is_numeric: true, is_fixed_size: true, value_size: Some(4) },
+            ColumnDatatype::Int64 => DatatypeInfo { is_numeric: true, is_fixed_size: true, value_size: Some(8) },
+            ColumnDatatype::Float => DatatypeInfo { is_numeric: true, is_fixed_size: true, value_size: Some(4) },
+            ColumnDatatype::FixedLength(s) => DatatypeInfo { is_numeric: false, is_fixed_size: true, value_size: Some(s as usize) },
+            ColumnDatatype::VariableLength => DatatypeInfo { is_numeric: false, is_fixed_size: false, value_size: None },
         }
     }
 }
@@ -180,7 +180,7 @@ impl Storage
         // Find, for all the numeric columns, the one with the biggest size.
         let max_size = self.columns.iter()
             .filter(|c| c.datatype_info.is_numeric)
-            .map(|c| c.datatype_info.value_size)
+            .map(|c| c.datatype_info.value_size.unwrap())
             .max().unwrap_or(1);    // If there are no numeric colums, assume size 1
 
         (blocks_in_stripe*disk_block_size) / max_size
@@ -203,13 +203,7 @@ impl Storage
         // Calculate the size of the stripe. It is the sum of the sizes of the compressed chunks.
         // We cannot do this because of issue #27739 :(
         //let stripe_size: usize = compressed_chunks.iter().map(|&CompressedChunk(_, _, c)| c.len()).sum();
-        let stripe_size: usize = {
-            let mut stripe_size = 0;
-            for &CompressedChunk(_, _, c) in compressed_chunks.iter() {
-                stripe_size += c.len();
-            }
-            stripe_size
-        };
+        let stripe_size: usize = compressed_chunks.iter().map(|&CompressedChunk(_, _, c)| c.len()).fold(0, |a, b| a + b);
 
         let stripe_header_absolute_offset = self.current_offset();
 
@@ -245,7 +239,7 @@ impl Storage
 
         // Now write all the compressed columns
         for &CompressedChunk(_, _, chunk) in compressed_chunks.iter() {
-            self.backend.write(chunk);
+            try!(self.backend.write(chunk));
         }
 
         self.stripes.push(proto_structs::Stripe {
@@ -354,43 +348,35 @@ impl fmt::Display for ColumnValue {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         fn write_bytes<'a>(f: &mut fmt::Formatter, iter: &mut Iterator<Item=&'a u8>) -> fmt::Result {
             while let Some(b) = iter.next() {
-                write!(f, "{:X} ", b);
+                try!(write!(f, "{:X} ", b));
             }
 
             Ok(())
         }
 
         match *self {
-            ColumnValue::Null => { write!(f, "(NULL)"); },
-            ColumnValue::Byte(v) => { write!(f, "Byte({})", v); },
-            ColumnValue::Int32(v) => { write!(f, "Int32({})", v); },
-            ColumnValue::Int64(v) => { write!(f, "Int64({})", v); },
-            ColumnValue::Float(v) => { write!(f, "Float({})", v); },
+            ColumnValue::Null => { write!(f, "(NULL)") },
+            ColumnValue::Byte(v) => { write!(f, "Byte({})", v) },
+            ColumnValue::Int32(v) => { write!(f, "Int32({})", v) },
+            ColumnValue::Int64(v) => { write!(f, "Int64({})", v) },
+            ColumnValue::Float(v) => { write!(f, "Float({})", v) },
             ColumnValue::FixedLength(ref v) => {
-                write!(f, "FixedLength(");
-                try!(write_bytes(f, &mut v.iter().take(5)));
-                if v.len() > 5 {
-                    write!(f, "...");
-                }
-                write!(f, ")");
+                write!(f, "FixedLength(")
+                    .and(write_bytes(f, &mut v.iter().take(5)))
+                    .and(if v.len() > 5 {write!(f, "...")} else {Ok(())})
+                    .and(write!(f, ")"))
             },
             ColumnValue::VariableLength(ref v) => {
-                write!(f, "VariableLength(");
-                // Try to convert the value to a string. If not possible,
-                // display the raw bytes.
-                match str::from_utf8(v) {
-                    Ok(s) => { write!(f, "\"{}\"", s); },
-                    Err(_) => {
-                        try!(write_bytes(f, &mut v.iter().take(5)));
-                        if v.len() > 5 {
-                            write!(f, "...");
-                        }
-                    }
-                };
-                write!(f, ")");
+                // Try to convert the value to a string. If not possible, display the raw bytes.
+                write!(f, "VariableLength(")
+                    .and(match str::from_utf8(v) {
+                        Ok(s) => write!(f, "\"{}\"", s),
+                        Err(_) => write_bytes(f, &mut v.iter().take(5))
+                            .and(if v.len() > 5 {write!(f, "...")} else {Ok(())})
+                    })
+                    .and(write!(f, ")"))
             }
-        };
-        Ok(())
+        }
     }
 }
 
@@ -573,8 +559,8 @@ impl ChunkGenerator for FixedLengthChunkGenerator {
         let nulls: Vec<u8> = self.nulls.iter().map(|n| if *n { 1 } else { 0 }).collect();
 
         self.encoded_chunk_buffer.clear();
-        self.encoded_chunk_buffer.write(&nulls);
-        self.encoded_chunk_buffer.write(&self.values);
+        self.encoded_chunk_buffer.write(&nulls).unwrap();
+        self.encoded_chunk_buffer.write(&self.values).unwrap();
 
         EncodedChunk(Encoding::Raw, &self.encoded_chunk_buffer)
     }
@@ -620,15 +606,15 @@ impl ChunkGenerator for VariableLengthChunkGenerator {
                     self.values.write(v).unwrap();
                 },
                 // Should never get to this point
-                _ => panic!("Internal error: Received an invalid value")
+                _ => unreachable!()
             }
         }
     }
 
     fn get_encoded_chunk<'a>(&'a mut self) -> EncodedChunk<'a> {
         self.encoded_chunk_buffer.clear();
-        self.encoded_chunk_buffer.write(get_slice_bytes(&self.sizes));
-        self.encoded_chunk_buffer.write(&self.values);
+        self.encoded_chunk_buffer.write(get_slice_bytes(&self.sizes)).unwrap();
+        self.encoded_chunk_buffer.write(&self.values).unwrap();
 
         EncodedChunk(Encoding::Raw, &self.encoded_chunk_buffer)
     }
@@ -657,7 +643,7 @@ impl InsertionManager {
         StorageInserter::new(self.storage_lock.clone())
     }
 
-    pub fn finish_inserting(mut self) -> StorageResult<Storage> {
+    pub fn finish_inserting(self) -> StorageResult<Storage> {
         let mut storage = Arc::try_unwrap(self.storage_lock)
             .ok().expect("Tried to finish inserting rows while there are pending insertions")
             .into_inner().unwrap();
@@ -802,7 +788,7 @@ mod test {
         assert_eq!(&buf[..], expected_signature);
 
         // Check the footer
-        file.seek(SeekFrom::End(-(expected_signature.len() as i64)));
+        file.seek(SeekFrom::End(-(expected_signature.len() as i64))).unwrap();
         file.read_exact(&mut buf).unwrap();
         assert_eq!(&buf[..], expected_signature);
     }

@@ -1,8 +1,31 @@
 use std::path::{Path, PathBuf};
 use std::fs;
 
-use ::os;
-use ::storage::{Storage, StorageBuilder, ColumnDatatype, StorageInserter, ColumnValue};
+use ::storage::{Storage, StorageBuilder, ColumnDatatype, ColumnValue};
+
+// ----------------------------------------------------------------------------
+use libc::{c_char, c_void, free};
+use std::ffi::{CString, CStr};
+
+extern {
+    fn tempnam(dir: *const c_char, prefix: *const c_char) -> *mut c_char;
+}
+
+pub fn tempname(prefix: &str) -> PathBuf {
+    let temp_dir = CString::new("/tmp").unwrap();
+    let prefix_ptr = CString::new(prefix).expect("tempname prefix contains non-UTF8 chars").as_ptr();
+
+    unsafe {
+        let buffer = tempnam(temp_dir.as_ptr(), prefix_ptr);
+        let path_name = CStr::from_ptr(buffer).to_str().unwrap();
+
+        let mut full_path = PathBuf::from(temp_dir.to_str().unwrap());
+        full_path.push(path_name);
+        free(buffer as *mut c_void);
+
+        full_path
+    }
+}
 
 // ----------------------------------------------------------------------------
 pub struct TestPath {
@@ -12,7 +35,7 @@ pub struct TestPath {
 
 impl TestPath {
     pub fn new() -> TestPath {
-        let path = os::tempname("storage");
+        let path = tempname("storage");
         fs::create_dir(&path).unwrap();
 
         TestPath {
@@ -84,12 +107,13 @@ fn storage_generates_right_columns() {
 // ----------------------------------------------------------------------------
 #[test]
 fn storage_builder_in_valid_path() {
-    let mut test_path = TestPath::new();
+    let test_path = TestPath::new();
     let test_file = test_path.file_name("test.storage");
     {
-        let builder = StorageBuilder::new()
+        StorageBuilder::new()
             .column("id", ColumnDatatype::Int32)
-            .at(&test_file);
+            .at(&test_file)
+            .unwrap();
     }
 
     // Check that the file exists
@@ -120,7 +144,7 @@ fn storage_with_duplicated_columns() {
 // ----------------------------------------------------------------------------
 #[test]
 fn a_single_row_can_be_inserted() {
-    let mut test_path = TestPath::new();
+    let test_path = TestPath::new();
     let test_file = test_path.file_name("test.storage");
 
     let mut storage = TestStorage::new(test_file.as_path());

@@ -1,9 +1,3 @@
-use std::io;
-
-use capnp::serialize;
-use capnp::traits;
-use capnp::message::{Builder as ProtoBuilder, HeapAllocator};
-
 use ::storage_capnp::stripe_header::Builder as StripeHeaderBuilder;
 use ::storage_capnp::column_chunk_header::Builder as ColumnChunkHeaderBuilder;
 
