@@ -3,11 +3,13 @@ extern crate libc;
 
 pub mod storage;
 
-mod test;
 mod os;
 mod proto_structs;
 mod encoding;
 mod compression;
+
+#[cfg(test)]
+mod test;
 
 #[allow(dead_code)]
 mod storage_capnp {
