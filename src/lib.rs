@@ -2,6 +2,7 @@ extern crate capnp;
 extern crate libc;
 
 pub mod storage;
+pub mod storage_inserter;
 
 mod os;
 mod proto_structs;

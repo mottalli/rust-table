@@ -40,6 +40,7 @@ pub struct StripeHeader {
     pub stripe_size: usize
 }
 
+#[derive(Debug, Clone)]
 pub struct Stripe {
     pub absolute_offset: usize,
     pub num_rows: usize
