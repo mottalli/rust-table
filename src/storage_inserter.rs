@@ -26,7 +26,6 @@ fn get_slice_bytes<'a, T>(s: &'a [T]) -> &'a [u8]
     unsafe { slice::from_raw_parts(ptr, size) }
 }
 
-
 trait ChunkGenerator {
     fn validate_value(&self, value: &ColumnValue) -> StorageResult<()>;
     fn get_encoded_chunk<'a>(&'a mut self) -> EncodedChunk<'a>;
@@ -253,7 +252,7 @@ impl StorageInserter
             max_rows_in_stripe: max_rows_in_stripe,
         }
     }
- 
+
     /// A hint for how many rows should fit in a storage stripe
     fn num_rows_in_stripe_hint(storage: &Storage) -> usize {
         let disk_block_size: usize = 4096;
@@ -405,4 +404,3 @@ impl Drop for StorageInserter
         self.flush().unwrap();
     }
 }
-

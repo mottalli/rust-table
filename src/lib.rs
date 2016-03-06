@@ -8,6 +8,7 @@ mod os;
 mod proto_structs;
 mod encoding;
 mod compression;
+mod storage_reader;
 
 #[cfg(test)]
 mod test;

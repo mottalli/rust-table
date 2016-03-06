@@ -82,6 +82,12 @@ pub struct ColumnBuilder {
 }
 
 // ----------------------------------------------------------------------------
+enum __StorageBackend {
+    Memory(Vec<u8>),
+    File(PathBuf)
+}
+
+// ----------------------------------------------------------------------------
 pub trait StorageBackend : Read + Write + Seek {}
 impl StorageBackend for File {}
 impl StorageBackend for Cursor<Vec<u8>> {}
@@ -92,7 +98,7 @@ pub struct Storage
     pub num_rows: usize,
     pub columns: Vec<Column>,
     pub backend: Box<StorageBackend>,
-    stripes: Vec<proto_structs::Stripe>
+    pub stripes: Vec<proto_structs::Stripe>
 }
 
 impl Storage
