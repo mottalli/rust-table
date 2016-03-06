@@ -9,6 +9,7 @@ mod proto_structs;
 mod encoding;
 mod compression;
 mod storage_reader;
+mod storage_backend;
 
 #[cfg(test)]
 mod test;

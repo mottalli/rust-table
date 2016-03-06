@@ -1,3 +1,4 @@
+/*
 use std::iter::Iterator;
 
 use ::storage::Storage;
@@ -36,3 +37,4 @@ impl<'a> Iterator for StorageStripeIterator<'a> {
         result
     }
 }
+*/
