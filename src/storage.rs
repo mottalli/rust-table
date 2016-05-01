@@ -1,5 +1,4 @@
 use std::path::{Path, PathBuf};
-use std::io;
 use std::io::{Read, Write, Seek, SeekFrom, Cursor};
 use std::fmt;
 use std::collections::hash_map::HashMap;
@@ -10,6 +9,7 @@ use std::{i8, i32, i64, f32};
 
 use ::proto_structs;
 use ::storage_inserter::InsertionManager;
+use ::error::{StorageError, StorageResult};
 
 // ----------------------------------------------------------------------------
 /// Basic types suppored by the storage backend
@@ -170,35 +170,6 @@ impl Storage
         self.num_rows += stripe.num_rows;
     }
 }
-
-// ----------------------------------------------------------------------------
-#[derive(Debug)]
-pub enum StorageError {
-    FileAlreadyExists,
-    InvalidPath(PathBuf),
-    InvalidFormat(String),
-    IoError(io::Error),
-    InvalidNumberOfColumns(usize, usize),
-    TypeError,
-    InvalidLength(usize, usize)
-}
-
-/*impl fmt::Debug for StorageError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
-            StorageError::FileAlreadyExists => write!(f, "File already exists"),
-            StorageError::InvalidPath(ref p) => write!(f, "Invalid path: {}", p.display()),
-            StorageError::InvalidFormat(ref desc) => write!(f, "Invalid storage format: {}", desc),
-            StorageError::IoError(ref e) => e.fmt(f),
-        }
-    }
-}*/
-
-impl From<io::Error> for StorageError {
-    fn from(err: io::Error) -> StorageError { StorageError::IoError(err) }
-}
-
-pub type StorageResult<T> = Result<T, StorageError>;
 
 // ----------------------------------------------------------------------------
 pub struct StorageBuilder {

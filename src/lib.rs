@@ -3,6 +3,7 @@ extern crate libc;
 
 pub mod storage;
 pub mod storage_inserter;
+pub mod error;
 
 mod os;
 mod proto_structs;

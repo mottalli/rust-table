@@ -8,7 +8,8 @@ use capnp::message::{Builder as ProtoBuilder};
 
 use ::encoding::Encoding;
 use ::compression::Compression;
-use ::storage::{ColumnDatatype, Storage, ColumnValue, StorageResult, StorageError, NumericValue};
+use ::storage::{ColumnDatatype, Storage, ColumnValue, NumericValue};
+use ::error::{StorageError, StorageResult};
 use ::proto_structs;
 use ::proto_structs::ProtocolBuildable;
 
