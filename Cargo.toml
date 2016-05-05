@@ -2,11 +2,9 @@
 name = "table"
 version = "0.1.0"
 authors = ["Marcelo Mottalli <mottalli@yahoo.com>"]
-build = "build.rs"
 
 [dependencies]
-capnp = "0.6.0"
-libc = "0.2.6"
+snappy = "0.3.0"
+rustc-serialize = "0.3.19"
 
 [build-dependencies]
-capnpc = "0.6.0"
