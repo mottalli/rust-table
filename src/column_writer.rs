@@ -6,8 +6,6 @@ use std::slice;
 use std::io;
 use std::io::BufWriter;
 
-use rustc_serialize::json;
-
 #[derive(Debug, Clone)]
 enum Value {
     Null,
@@ -16,47 +14,102 @@ enum Value {
     Raw(Vec<u8>)
 }
 
-enum Encoding {
+enum Encoder {
     Flat,
     RLE
 }
 
-impl fmt::Display for Encoding {
+#[derive(Debug)]
+struct EncoderError;
+
+impl Encoder {
+    fn encode<T>(&self, values: &[T]) -> Result<Vec<T>, EncoderError> 
+        where T: Clone
+    {
+        let encoded: Vec<T> = match *self {
+            Encoder::Flat => Vec::from(values),
+            Encoder::RLE => unimplemented!()
+        };
+
+        Ok(encoded)
+    }
+}
+
+impl fmt::Display for Encoder {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let desc = match *self {
-            Encoding::Flat => "Flat",
-            Encoding::RLE => "RLE"
+            Encoder::Flat => "Flat",
+            Encoder::RLE => "RLE"
         };
         
         write!(f, "{}", desc)
     }
 }
 
-enum Compression {
+#[derive(Debug)]
+struct CompressorError;
+
+enum Compressor {
     Raw,
     Snappy
 }
 
-impl fmt::Display for Compression {
+impl Compressor {
+    fn compress(&self, buffer: &[u8]) -> Result<Vec<u8>, CompressorError> {
+        let compressed: Vec<u8> = match *self {
+            Compressor::Raw => Vec::from(buffer),
+            Compressor::Snappy => snappy::compress(buffer)
+        };
+
+        Ok(compressed)
+    }
+}
+
+impl fmt::Display for Compressor {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let desc = match *self {
-            Compression::Raw => "Raw",
-            Compression::Snappy => "Snappy"
+            Compressor::Raw => "Raw",
+            Compressor::Snappy => "Snappy"
         };
 
         write!(f, "{}", desc)
     }
 }
 
+struct BlockGenerator {
+    encoder: Encoder,
+    compressor: Compressor,
+    null_compressor: Compressor,
+}
+
+impl BlockGenerator {
+    fn new(encoder: Encoder, compressor: Compressor) -> BlockGenerator {
+        BlockGenerator {
+            encoder: encoder,
+            compressor: compressor,
+            null_compressor: Compressor::Snappy
+        }
+    }
+
+    fn generate_block<T>(&self, nulls: &[bool], values: &[T]) -> StorageBlock
+        where T: Clone
+    {
+        let encoded_values = self.encoder.encode(values).unwrap();
+        let compressed_values = self.compressor.compress(get_slice_bytes(&encoded_values)).unwrap();
+        let compressed_nulls = self.null_compressor.compress(get_slice_bytes(&nulls)).unwrap();
+        unimplemented!();
+    }
+}
+
 struct CompressedBuffer {
-    encoding: Encoding,
-    compression: Compression,
+    encoding: Encoder,
+    compression: Compressor,
     uncompressed_size: usize,
     compressed_data: Vec<u8>
 }
 
 impl CompressedBuffer {
-    fn new(encoding: Encoding, compression: Compression, uncompressed_size: usize, values: Vec<u8>) -> CompressedBuffer {
+    fn new(encoding: Encoder, compression: Compressor, uncompressed_size: usize, values: Vec<u8>) -> CompressedBuffer {
         CompressedBuffer {
             encoding: encoding,
             compression: compression,
@@ -92,6 +145,11 @@ struct StorageBlock {
     compressed_values: CompressedBuffer
 }
 
+trait Serializable: Sized {
+    fn serialize(&self, writer: &mut io::Write) -> io::Result<usize>;
+    fn unserialize(reader: &mut io::Read) -> io::Result<Self>;
+}
+
 
 #[derive(Debug)]
 struct InvalidTypeError;
@@ -101,7 +159,7 @@ struct InvalidRowError;
 
 trait ColumnGenerator {
     fn append_value(&mut self, value: &Value) -> Result<(), InvalidTypeError>; 
-    fn encode_values(&self) -> StorageBlock;
+    fn generate_block(&self) -> StorageBlock;
     fn get_raw_size(&self) -> usize;
     fn reset(&mut self);
 }
@@ -125,6 +183,57 @@ impl<T> NativeColumnGenerator<T>
             nulls: Vec::new(),
             values: Vec::new()
         }
+    }
+}
+
+struct NullsBitmap {
+    packed_bits: Vec<u8>,
+    num_values: usize
+}
+
+impl NullsBitmap {
+    fn new() -> NullsBitmap {
+        NullsBitmap {
+            packed_bits: Vec::new(),
+            num_values: 0
+        }
+    }
+
+    fn reset(&mut self) {
+        self.packed_bits.truncate(0);
+        self.num_values = 0;
+    }
+
+    fn append_null(&mut self) {
+        self.append(false);
+    }
+
+    fn append_not_null(&mut self) {
+        self.append(true);
+    }
+
+    fn append(&mut self, has_value: bool) {
+        let bit_offset = self.num_values % 8;
+
+        if bit_offset == 0 {
+            self.packed_bits.push(0);
+        }
+
+        if has_value {
+            let last_byte_offset = self.packed_bits.len()-1;
+            let mut last_byte: &mut u8 = unsafe { self.packed_bits.get_unchecked_mut(last_byte_offset) };
+            *last_byte |= 1 << bit_offset;
+        }
+
+        self.num_values += 1;
+    }
+
+    fn get_raw_bits<'a>(&'a self) -> &'a [u8] {
+        &self.packed_bits
+    }
+
+    fn len(&self) -> usize {
+        self.num_values
     }
 }
 
@@ -171,11 +280,11 @@ impl<T> ColumnGenerator for NativeColumnGenerator<T>
         self.values.truncate(0);
     }
 
-    fn encode_values(&self) -> StorageBlock {
+    fn generate_block(&self) -> StorageBlock {
         let raw_bytes: &[u8] = get_slice_bytes(self.values.as_slice());
 
-        let encoding = Encoding::Flat;
-        let compression = Compression::Snappy;
+        let encoding = Encoder::Flat;
+        let compression = Compressor::Snappy;
 
         let compressed_values = CompressedBuffer::new(
             encoding, 
@@ -184,8 +293,8 @@ impl<T> ColumnGenerator for NativeColumnGenerator<T>
             snappy::compress(raw_bytes)
         );
         let compressed_nulls = CompressedBuffer::new(
-            Encoding::Flat, 
-            Compression::Raw, 
+            Encoder::Flat, 
+            Compressor::Raw, 
             self.nulls.len(), 
             self.nulls.iter().map(|&b| if b {1u8} else {0u8}).collect()
         );
@@ -206,7 +315,6 @@ struct TableWriter<'a> {
     block_size: usize,
     column_generators: Vec<Box<ColumnGenerator>>,
     writer: &'a mut io::Write,
-    encoder: json::Encoder<'a>,
     num_rows: usize
 }
 
@@ -216,7 +324,6 @@ impl<'a> TableWriter<'a> {
             block_size: block_size,
             column_generators: generators,
             writer: writer,
-            encoder: json::Encoder::new(&mut writer),
             num_rows: 0
         }
     }
@@ -233,7 +340,7 @@ impl<'a> TableWriter<'a> {
         self.num_rows += 1;
 
         if self.num_rows % self.block_size == 0 {
-            let blocks = self.column_generators.iter_mut().map(|g| g.encode_values()).collect::<Vec<_>>();
+            let blocks = self.column_generators.iter_mut().map(|g| g.generate_block()).collect::<Vec<_>>();
         }
 
         Ok(())
@@ -277,7 +384,7 @@ fn test_encoding() {
         generator.append_value(&Value::Int(10)).unwrap();
     }
 
-    let block = generator.encode_values();
+    let block = generator.generate_block();
 }
 
 #[test]
@@ -301,5 +408,43 @@ fn test_table_generator() {
             table_writer.append_row(row).unwrap();
         }
     }
-
 }
+
+#[test]
+fn test_nulls_bitmap() {
+    let mut bitmap = NullsBitmap::new();
+    assert_eq!(bitmap.len(), 0);
+
+    bitmap.append_null();
+    bitmap.append_null();
+    bitmap.append_not_null();
+    bitmap.append_null();
+
+    {
+        let bits = bitmap.get_raw_bits();
+        assert_eq!(bitmap.len(), 4);
+        assert_eq!(bits.len(), 1);
+        assert_eq!(*bits.get(0).unwrap(), 0b00000100);
+    }
+
+    bitmap.append_null();
+    bitmap.append_not_null();
+    bitmap.append_null();
+    bitmap.append_not_null();
+    // End of first byte
+
+    bitmap.append_not_null();
+
+    {
+        let bits = bitmap.get_raw_bits();
+        assert_eq!(bitmap.len(), 9);
+        assert_eq!(bits.len(), 2);
+        assert_eq!(*bits.get(0).unwrap(), 0b10100100);
+        assert_eq!(*bits.get(1).unwrap(), 0b00000001);
+    }
+
+    bitmap.reset();
+    assert_eq!(bitmap.len(), 0);
+}
+
+
