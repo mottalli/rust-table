@@ -14,6 +14,7 @@ enum Value {
     Raw(Vec<u8>)
 }
 
+#[derive(Debug, Clone)]
 enum Encoder {
     Flat,
     RLE
@@ -46,22 +47,18 @@ impl fmt::Display for Encoder {
     }
 }
 
-#[derive(Debug)]
-struct CompressorError;
-
+#[derive(Debug, Clone)]
 enum Compressor {
     Raw,
     Snappy
 }
 
 impl Compressor {
-    fn compress(&self, buffer: &[u8]) -> Result<Vec<u8>, CompressorError> {
-        let compressed: Vec<u8> = match *self {
+    fn compress(&self, buffer: &[u8]) -> Vec<u8> {
+        match *self {
             Compressor::Raw => Vec::from(buffer),
             Compressor::Snappy => snappy::compress(buffer)
-        };
-
-        Ok(compressed)
+        }
     }
 }
 
@@ -91,33 +88,43 @@ impl BlockGenerator {
         }
     }
 
-    fn generate_block<T>(&self, nulls: &[bool], values: &[T]) -> StorageBlock
+    fn generate_block<T>(&self, nulls: &NullsBitmap, values: &[T]) -> StorageBlock
         where T: Clone
     {
+        assert_eq!(nulls.len(), values.len());
+
         let encoded_values = self.encoder.encode(values).unwrap();
-        let compressed_values = self.compressor.compress(get_slice_bytes(&encoded_values)).unwrap();
-        let compressed_nulls = self.null_compressor.compress(get_slice_bytes(&nulls)).unwrap();
-        unimplemented!();
+        let encoded_values_bytes = get_slice_bytes(&encoded_values);
+        let compressed_values: Vec<u8> = self.compressor.compress(encoded_values_bytes);
+
+        let nulls_bits = nulls.get_raw_bits();
+        let compressed_nulls: Vec<u8> = self.null_compressor.compress(nulls_bits);
+
+        StorageBlock {
+            compressed_nulls_bitmap: EncodedCompressedBuffer {
+                encoding: Encoder::Flat,
+                compression: self.null_compressor.clone(),
+                uncompressed_size: nulls_bits.len(),
+                compressed_data: compressed_nulls
+            },
+            compressed_values: EncodedCompressedBuffer {
+                encoding: self.encoder.clone(),
+                compression: self.compressor.clone(),
+                uncompressed_size: encoded_values_bytes.len(),
+                compressed_data: compressed_values
+            }
+        }
     }
 }
 
-struct CompressedBuffer {
+struct EncodedCompressedBuffer {
     encoding: Encoder,
     compression: Compressor,
     uncompressed_size: usize,
     compressed_data: Vec<u8>
 }
 
-impl CompressedBuffer {
-    fn new(encoding: Encoder, compression: Compressor, uncompressed_size: usize, values: Vec<u8>) -> CompressedBuffer {
-        CompressedBuffer {
-            encoding: encoding,
-            compression: compression,
-            uncompressed_size: uncompressed_size,
-            compressed_data: values
-        }
-    }
-
+impl EncodedCompressedBuffer {
     fn get_compressed_size(&self) -> usize { 
         self.compressed_data.len() 
     }
@@ -128,7 +135,7 @@ impl CompressedBuffer {
     }
 }
 
-impl fmt::Display for CompressedBuffer {
+impl fmt::Display for EncodedCompressedBuffer {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "Compressed buffer: {}, {}, {} bytes ({} uncompressed, {}% compression rate)", 
                self.encoding, 
@@ -141,8 +148,8 @@ impl fmt::Display for CompressedBuffer {
 }
 
 struct StorageBlock {
-    compressed_nulls_bitmap: CompressedBuffer,
-    compressed_values: CompressedBuffer
+    compressed_nulls_bitmap: EncodedCompressedBuffer,
+    compressed_values: EncodedCompressedBuffer
 }
 
 trait Serializable: Sized {
@@ -165,14 +172,15 @@ trait ColumnGenerator {
 }
 
 trait NativeDatatype {
-    type NativeType;
+    type NativeType: Clone;
 
     fn extract_native_value(value: &Value) -> Result<Self::NativeType, InvalidTypeError>;
 }
 
 struct NativeColumnGenerator<T: NativeDatatype> {
-    nulls: Vec<bool>,
-    values: Vec<T::NativeType>
+    nulls: NullsBitmap,
+    values: Vec<T::NativeType>,
+    block_generator: BlockGenerator
 }
 
 impl<T> NativeColumnGenerator<T> 
@@ -180,8 +188,9 @@ impl<T> NativeColumnGenerator<T>
 {
     fn new() -> NativeColumnGenerator<T> {
         NativeColumnGenerator {
-            nulls: Vec::new(),
-            values: Vec::new()
+            nulls: NullsBitmap::new(),
+            values: Vec::new(),
+            block_generator: BlockGenerator::new(Encoder::Flat, Compressor::Snappy)
         }
     }
 }
@@ -269,41 +278,19 @@ impl<T> ColumnGenerator for NativeColumnGenerator<T>
     fn append_value(&mut self, value: &Value) -> Result<(), InvalidTypeError> {
         extract_native_value_or_null::<T>(value).map(|opt_val| {
             match opt_val {
-                None => self.nulls.push(true),
-                Some(v) => { self.nulls.push(false); self.values.push(v); }
+                None => self.nulls.append_null(),
+                Some(v) => { self.nulls.append_not_null(); self.values.push(v); }
             }
         })
     }
 
     fn reset(&mut self) {
-        self.nulls.truncate(0);
+        self.nulls.reset();
         self.values.truncate(0);
     }
 
     fn generate_block(&self) -> StorageBlock {
-        let raw_bytes: &[u8] = get_slice_bytes(self.values.as_slice());
-
-        let encoding = Encoder::Flat;
-        let compression = Compressor::Snappy;
-
-        let compressed_values = CompressedBuffer::new(
-            encoding, 
-            compression, 
-            self.get_raw_size(), 
-            snappy::compress(raw_bytes)
-        );
-        let compressed_nulls = CompressedBuffer::new(
-            Encoder::Flat, 
-            Compressor::Raw, 
-            self.nulls.len(), 
-            self.nulls.iter().map(|&b| if b {1u8} else {0u8}).collect()
-        );
-
-        StorageBlock {
-            compressed_nulls_bitmap: compressed_nulls,
-            compressed_values: compressed_values
-        }
-
+        self.block_generator.generate_block(&self.nulls, &self.values)
     }
 
     fn get_raw_size(&self) -> usize {
@@ -355,12 +342,12 @@ fn test_new() {
     assert_eq!(generator.values.len(), 1);
     assert_eq!(generator.nulls.len(), 1);
     assert_eq!(generator.values[0], 42);
-    assert_eq!(generator.nulls[0], false);
+    //assert_eq!(generator.nulls[0], false);
 
     generator.append_value(&Value::Null).unwrap();
     assert_eq!(generator.values.len(), 1);
     assert_eq!(generator.nulls.len(), 2);
-    assert_eq!(generator.nulls[1], true);
+    //assert_eq!(generator.nulls[1], true);
 }
 
 #[test]
@@ -446,5 +433,3 @@ fn test_nulls_bitmap() {
     bitmap.reset();
     assert_eq!(bitmap.len(), 0);
 }
-
-

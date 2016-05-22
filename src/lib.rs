@@ -1,4 +1,6 @@
 extern crate rustc_serialize;
+extern crate log;
+extern crate bincode;
 
 mod column_writer;
-mod serializer;
+mod file_format;

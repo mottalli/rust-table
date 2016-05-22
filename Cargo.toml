@@ -6,5 +6,10 @@ authors = ["Marcelo Mottalli <mottalli@yahoo.com>"]
 [dependencies]
 snappy = "0.3.0"
 rustc-serialize = "0.3.19"
+log = "0.3"
+bincode = "0.5.6"
 
 [build-dependencies]
+
+[dev-dependencies]
+env_logger = "0.3"
