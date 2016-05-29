@@ -298,15 +298,19 @@ impl<T> ColumnGenerator for NativeColumnGenerator<T>
     }
 }
 
-struct TableWriter<'a> {
+struct TableWriter<'a, W>
+    where W: 'a + io::Write + io::Seek
+{
     block_size: usize,
     column_generators: Vec<Box<ColumnGenerator>>,
-    writer: &'a mut io::Write,
+    writer: &'a mut W,
     num_rows: usize
 }
 
-impl<'a> TableWriter<'a> {
-    fn new(block_size: usize, generators: Vec<Box<ColumnGenerator>>, writer: &'a mut io::Write) -> TableWriter<'a> {
+impl<'a, W> TableWriter<'a, W> 
+    where W: io::Write + io::Seek
+{
+    fn new(block_size: usize, generators: Vec<Box<ColumnGenerator>>, writer: &'a mut W) -> TableWriter<'a, W> {
         TableWriter {
             block_size: block_size,
             column_generators: generators,
@@ -327,10 +331,21 @@ impl<'a> TableWriter<'a> {
         self.num_rows += 1;
 
         if self.num_rows % self.block_size == 0 {
-            let blocks = self.column_generators.iter_mut().map(|g| g.generate_block()).collect::<Vec<_>>();
+            self.flush_chunk();
         }
 
         Ok(())
+    }
+
+    fn current_offset(&mut self) -> usize {
+        self.writer.seek(io::SeekFrom::Current(0)).unwrap() as usize
+    }
+
+    fn flush_chunk(&mut self) -> io::Result<()> {
+        let blocks: Vec<StorageBlock> = self.column_generators.iter_mut().map(|g| g.generate_block()).collect::<Vec<_>>();
+        let current_position = self.current_offset();
+
+        unimplemented!();
     }
 }
 
@@ -377,7 +392,7 @@ fn test_encoding() {
 #[test]
 fn test_table_generator() {
     let mut buffer = Vec::<u8>::new();
-    let mut buf_writer = BufWriter::new(buffer);
+    let mut buf_writer = io::Cursor::new(buffer);
 
     let generators = {
         let mut v = Vec::<Box<ColumnGenerator>>::new();

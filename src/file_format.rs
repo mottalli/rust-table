@@ -2,16 +2,22 @@ use std::io::{Write, Read};
 use bincode::rustc_serialize::{encode_into, decode_from};
 use bincode::SizeLimit;
 
+#[derive(PartialEq, Debug, RustcEncodable, RustcDecodable)]
+enum Bar {
+    BAR, BAZ
+}
+
 #[derive(RustcEncodable, RustcDecodable)]
 struct Foo {
     x: i16,
     y: f32,
-    z: Vec<i8>
+    z: Vec<i8>,
+    aa: Bar
 }
 
 #[test]
 fn test_bincode() {
-    let foo = Foo { x: 12, y: 34.56, z: vec![1,2,3] };
+    let foo = Foo { x: 12, y: 34.56, z: vec![1,2,3], aa: Bar::BAR };
 
     let mut buffer: Vec<u8> = Vec::new();
 
@@ -21,4 +27,5 @@ fn test_bincode() {
     assert_eq!(decoded.x, 12);
     assert_eq!(decoded.y, 34.56);
     assert_eq!(decoded.z, vec![1,2,3]);
+    assert_eq!(decoded.aa, Bar::BAR);
 }
