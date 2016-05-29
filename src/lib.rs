@@ -4,3 +4,6 @@ extern crate bincode;
 
 mod column_writer;
 mod file_format;
+mod encoding;
+mod compression;
+mod nulls_bitmap;

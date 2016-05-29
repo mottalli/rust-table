@@ -1,7 +1,48 @@
 use std::io::{Write, Read};
-use bincode::rustc_serialize::{encode_into, decode_from};
 use bincode::SizeLimit;
 
+use encoding::Encoder;
+use compression::Compressor;
+
+#[derive(RustcEncodable, RustcDecodable)]
+pub struct ChunkHeader {
+    pub nulls_encoder: Encoder,
+    pub nulls_compressor: Compressor,
+    pub nulls_size: usize,
+    pub values_encoder: Encoder,
+    pub values_compressor: Compressor,
+    pub values_size: usize,
+}
+
+#[derive(RustcEncodable, RustcDecodable)]
+pub struct TableMetadata {
+    pub num_rows: usize,
+    pub blocks: Vec<BlockMetadata>
+}
+
+impl TableMetadata {
+    pub fn new() -> TableMetadata {
+        TableMetadata {
+            num_rows: 0,
+            blocks: Vec::new()
+        }
+    }
+}
+
+#[derive(RustcEncodable, RustcDecodable)]
+pub struct BlockMetadata {
+    pub num_rows_in_block: usize,
+    pub chunks: Vec<ChunkMetadata>
+}
+
+#[derive(RustcEncodable, RustcDecodable)]
+pub struct ChunkMetadata {
+    pub file: Option<String>,
+    pub offset_in_file: usize
+}
+
+//#[derive(PartialEq, Debug, RustcEncodable, RustcDecodable)]
+/*
 #[derive(PartialEq, Debug, RustcEncodable, RustcDecodable)]
 enum Bar {
     BAR, BAZ
@@ -29,3 +70,4 @@ fn test_bincode() {
     assert_eq!(decoded.z, vec![1,2,3]);
     assert_eq!(decoded.aa, Bar::BAR);
 }
+*/

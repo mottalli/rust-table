@@ -1,10 +1,16 @@
-extern crate snappy;
-
 use std::fmt;
 use std::mem;
 use std::slice;
 use std::io;
 use std::io::BufWriter;
+use bincode::rustc_serialize::{encode_into, EncodingResult};
+use rustc_serialize::Encodable;
+use bincode::SizeLimit;
+
+use compression::Compressor;
+use encoding::Encoder;
+use nulls_bitmap::NullsBitmap;
+use file_format;
 
 #[derive(Debug, Clone)]
 enum Value {
@@ -14,117 +20,59 @@ enum Value {
     Raw(Vec<u8>)
 }
 
-#[derive(Debug, Clone)]
-enum Encoder {
-    Flat,
-    RLE
-}
-
-#[derive(Debug)]
-struct EncoderError;
-
-impl Encoder {
-    fn encode<T>(&self, values: &[T]) -> Result<Vec<T>, EncoderError> 
-        where T: Clone
-    {
-        let encoded: Vec<T> = match *self {
-            Encoder::Flat => Vec::from(values),
-            Encoder::RLE => unimplemented!()
-        };
-
-        Ok(encoded)
-    }
-}
-
-impl fmt::Display for Encoder {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let desc = match *self {
-            Encoder::Flat => "Flat",
-            Encoder::RLE => "RLE"
-        };
-        
-        write!(f, "{}", desc)
-    }
-}
-
-#[derive(Debug, Clone)]
-enum Compressor {
-    Raw,
-    Snappy
-}
-
-impl Compressor {
-    fn compress(&self, buffer: &[u8]) -> Vec<u8> {
-        match *self {
-            Compressor::Raw => Vec::from(buffer),
-            Compressor::Snappy => snappy::compress(buffer)
-        }
-    }
-}
-
-impl fmt::Display for Compressor {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let desc = match *self {
-            Compressor::Raw => "Raw",
-            Compressor::Snappy => "Snappy"
-        };
-
-        write!(f, "{}", desc)
-    }
-}
-
-struct BlockGenerator {
+struct ChunkGenerator {
     encoder: Encoder,
     compressor: Compressor,
     null_compressor: Compressor,
 }
 
-impl BlockGenerator {
-    fn new(encoder: Encoder, compressor: Compressor) -> BlockGenerator {
-        BlockGenerator {
+impl ChunkGenerator {
+    fn new(encoder: Encoder, compressor: Compressor) -> ChunkGenerator {
+        ChunkGenerator {
             encoder: encoder,
             compressor: compressor,
             null_compressor: Compressor::Snappy
         }
     }
 
-    fn generate_block<T>(&self, nulls: &NullsBitmap, values: &[T]) -> StorageBlock
+    fn generate_chunk<T>(&self, nulls: &NullsBitmap, values: &[T]) -> StorageChunk
         where T: Clone
     {
         assert_eq!(nulls.len(), values.len());
 
-        let encoded_values = self.encoder.encode(values).unwrap();
+        let encoded_values = self.encoder.encode(values).expect("Unable to encode values");
         let encoded_values_bytes = get_slice_bytes(&encoded_values);
-        let compressed_values: Vec<u8> = self.compressor.compress(encoded_values_bytes);
 
         let nulls_bits = nulls.get_raw_bits();
-        let compressed_nulls: Vec<u8> = self.null_compressor.compress(nulls_bits);
 
-        StorageBlock {
-            compressed_nulls_bitmap: EncodedCompressedBuffer {
-                encoding: Encoder::Flat,
-                compression: self.null_compressor.clone(),
-                uncompressed_size: nulls_bits.len(),
-                compressed_data: compressed_nulls
-            },
-            compressed_values: EncodedCompressedBuffer {
-                encoding: self.encoder.clone(),
-                compression: self.compressor.clone(),
-                uncompressed_size: encoded_values_bytes.len(),
-                compressed_data: compressed_values
-            }
+        StorageChunk {
+            compressed_nulls_bitmap: EncodedCompressedBuffer::from(&Encoder::Flat, &self.null_compressor, &nulls_bits),
+            compressed_values: EncodedCompressedBuffer::from(&self.encoder, &self.compressor, &encoded_values_bytes)
         }
     }
 }
 
 struct EncodedCompressedBuffer {
-    encoding: Encoder,
-    compression: Compressor,
+    encoder: Encoder,
+    compressor: Compressor,
     uncompressed_size: usize,
     compressed_data: Vec<u8>
 }
 
 impl EncodedCompressedBuffer {
+    fn from(encoder: &Encoder, compressor: &Compressor, data: &[u8]) -> EncodedCompressedBuffer {
+        let encoded_values = encoder.encode(data).expect("Unable to encode values");
+        let encoded_values_bytes = get_slice_bytes(&encoded_values);
+        let compressed_data: Vec<u8> = compressor.compress(encoded_values_bytes);
+        
+        EncodedCompressedBuffer {
+            encoder: encoder.clone(),
+            compressor: compressor.clone(),
+            uncompressed_size: data.len(),
+            compressed_data: compressed_data
+        }
+    }
+
     fn get_compressed_size(&self) -> usize { 
         self.compressed_data.len() 
     }
@@ -138,8 +86,8 @@ impl EncodedCompressedBuffer {
 impl fmt::Display for EncodedCompressedBuffer {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "Compressed buffer: {}, {}, {} bytes ({} uncompressed, {}% compression rate)", 
-               self.encoding, 
-               self.compression, 
+               self.encoder, 
+               self.compressor, 
                self.get_compressed_size(), 
                self.uncompressed_size,
                self.get_compression_rate() * 100.0
@@ -147,9 +95,20 @@ impl fmt::Display for EncodedCompressedBuffer {
     }
 }
 
-struct StorageBlock {
+struct StorageChunk {
     compressed_nulls_bitmap: EncodedCompressedBuffer,
     compressed_values: EncodedCompressedBuffer
+}
+
+impl StorageChunk {
+    fn get_total_compressed_size(&self) -> usize {
+        [&self.compressed_nulls_bitmap,
+            &self.compressed_values]
+        .iter()
+        .map(|b| b.compressed_data.len())
+        //.sum
+        .fold(0, |acc, x| acc + x)
+    }
 }
 
 trait Serializable: Sized {
@@ -166,7 +125,7 @@ struct InvalidRowError;
 
 trait ColumnGenerator {
     fn append_value(&mut self, value: &Value) -> Result<(), InvalidTypeError>; 
-    fn generate_block(&self) -> StorageBlock;
+    fn generate_chunk(&self) -> StorageChunk;
     fn get_raw_size(&self) -> usize;
     fn reset(&mut self);
 }
@@ -180,7 +139,7 @@ trait NativeDatatype {
 struct NativeColumnGenerator<T: NativeDatatype> {
     nulls: NullsBitmap,
     values: Vec<T::NativeType>,
-    block_generator: BlockGenerator
+    chunk_generator: ChunkGenerator
 }
 
 impl<T> NativeColumnGenerator<T> 
@@ -190,59 +149,8 @@ impl<T> NativeColumnGenerator<T>
         NativeColumnGenerator {
             nulls: NullsBitmap::new(),
             values: Vec::new(),
-            block_generator: BlockGenerator::new(Encoder::Flat, Compressor::Snappy)
+            chunk_generator: ChunkGenerator::new(Encoder::Flat, Compressor::Snappy)
         }
-    }
-}
-
-struct NullsBitmap {
-    packed_bits: Vec<u8>,
-    num_values: usize
-}
-
-impl NullsBitmap {
-    fn new() -> NullsBitmap {
-        NullsBitmap {
-            packed_bits: Vec::new(),
-            num_values: 0
-        }
-    }
-
-    fn reset(&mut self) {
-        self.packed_bits.truncate(0);
-        self.num_values = 0;
-    }
-
-    fn append_null(&mut self) {
-        self.append(false);
-    }
-
-    fn append_not_null(&mut self) {
-        self.append(true);
-    }
-
-    fn append(&mut self, has_value: bool) {
-        let bit_offset = self.num_values % 8;
-
-        if bit_offset == 0 {
-            self.packed_bits.push(0);
-        }
-
-        if has_value {
-            let last_byte_offset = self.packed_bits.len()-1;
-            let mut last_byte: &mut u8 = unsafe { self.packed_bits.get_unchecked_mut(last_byte_offset) };
-            *last_byte |= 1 << bit_offset;
-        }
-
-        self.num_values += 1;
-    }
-
-    fn get_raw_bits<'a>(&'a self) -> &'a [u8] {
-        &self.packed_bits
-    }
-
-    fn len(&self) -> usize {
-        self.num_values
     }
 }
 
@@ -289,8 +197,8 @@ impl<T> ColumnGenerator for NativeColumnGenerator<T>
         self.values.truncate(0);
     }
 
-    fn generate_block(&self) -> StorageBlock {
-        self.block_generator.generate_block(&self.nulls, &self.values)
+    fn generate_chunk(&self) -> StorageChunk {
+        self.chunk_generator.generate_chunk(&self.nulls, &self.values)
     }
 
     fn get_raw_size(&self) -> usize {
@@ -298,28 +206,58 @@ impl<T> ColumnGenerator for NativeColumnGenerator<T>
     }
 }
 
-struct TableWriter<'a, W>
-    where W: 'a + io::Write + io::Seek
+struct TableWriter<W>
+    where W: io::Write + io::Seek
 {
     block_size: usize,
     column_generators: Vec<Box<ColumnGenerator>>,
-    writer: &'a mut W,
-    num_rows: usize
+    writer: W,
+    num_rows: usize,
+    num_rows_in_current_block: usize,
+    table_metadata: file_format::TableMetadata
 }
 
-impl<'a, W> TableWriter<'a, W> 
+static HEADER: [u8; 4] = ['S' as u8, 'N' as u8, 'E' as u8, 'L' as u8];
+
+fn encode_to<T: Encodable, W: io::Write>(writer: &mut W, value: &T) -> EncodingResult<()> {
+    encode_into(value, writer, SizeLimit::Infinite)
+}
+
+impl<W> TableWriter<W> 
     where W: io::Write + io::Seek
 {
-    fn new(block_size: usize, generators: Vec<Box<ColumnGenerator>>, writer: &'a mut W) -> TableWriter<'a, W> {
-        TableWriter {
+    fn new_into(writer: W, block_size: usize, generators: Vec<Box<ColumnGenerator>>) -> TableWriter<W> {
+        let mut writer = TableWriter {
             block_size: block_size,
             column_generators: generators,
             writer: writer,
-            num_rows: 0
-        }
+            num_rows: 0,
+            num_rows_in_current_block: 0,
+            table_metadata: file_format::TableMetadata::new()
+        };
+
+        writer.write_signature().expect("Unable to initialize new storage file");
+        writer
     }
 
-    fn append_row(&mut self, row: Vec<Value>) -> Result<(), InvalidRowError> {
+    fn write_signature(&mut self) -> io::Result<()> {
+        try!(self.writer.write(&HEADER));
+        Ok(())
+    }
+
+    fn write_footer(&mut self) -> io::Result<()> {
+        let current_offset: usize = self.current_offset();
+        encode_to(&mut self.writer, &self.table_metadata).expect("Unable to write table metadata");
+        encode_to(&mut self.writer, &current_offset).expect("Unable to write offset of table metadata");
+        self.write_signature()
+    }
+
+    pub fn finalize(mut self) -> W {
+        self.write_footer();
+        self.writer
+    }
+
+    fn append_row(&mut self, row: &Vec<Value>) -> Result<(), InvalidRowError> {
         if row.len() != self.column_generators.len() {
             return Err(InvalidRowError);
         }
@@ -329,9 +267,10 @@ impl<'a, W> TableWriter<'a, W>
         }
 
         self.num_rows += 1;
+        self.num_rows_in_current_block += 1;
 
         if self.num_rows % self.block_size == 0 {
-            self.flush_chunk();
+            self.flush_block();
         }
 
         Ok(())
@@ -341,11 +280,43 @@ impl<'a, W> TableWriter<'a, W>
         self.writer.seek(io::SeekFrom::Current(0)).unwrap() as usize
     }
 
-    fn flush_chunk(&mut self) -> io::Result<()> {
-        let blocks: Vec<StorageBlock> = self.column_generators.iter_mut().map(|g| g.generate_block()).collect::<Vec<_>>();
-        let current_position = self.current_offset();
+    fn flush_block(&mut self) -> io::Result<()> {
+        let chunks: Vec<StorageChunk> = self.column_generators.iter_mut().map(|g| g.generate_chunk()).collect::<Vec<_>>();
 
-        unimplemented!();
+        let chunks_metadata: Vec<file_format::ChunkMetadata> = chunks.iter().map(|chunk| {
+            let chunk_header = file_format::ChunkHeader {
+                nulls_encoder: chunk.compressed_nulls_bitmap.encoder.clone(),
+                nulls_compressor: chunk.compressed_nulls_bitmap.compressor.clone(),
+                nulls_size: chunk.compressed_nulls_bitmap.compressed_data.len(),
+                values_encoder: chunk.compressed_values.encoder.clone(),
+                values_compressor: chunk.compressed_values.compressor.clone(),
+                values_size: chunk.compressed_values.compressed_data.len()
+            };
+
+            let current_offset = self.current_offset();
+
+            encode_to(&mut self.writer, &chunk_header).expect("Unable to write chunk header");
+            self.writer.write(&chunk.compressed_nulls_bitmap.compressed_data).expect("Unable to write null values");
+            self.writer.write(&chunk.compressed_values.compressed_data).expect("Unable to write values");
+
+            file_format::ChunkMetadata {
+                file: None,
+                offset_in_file: current_offset
+            }
+        }).collect();
+
+        self.table_metadata.blocks.push(file_format::BlockMetadata {
+            num_rows_in_block: self.num_rows_in_current_block,
+            chunks: chunks_metadata
+        });
+
+        // Reset the current block
+        self.num_rows_in_current_block = 0;
+        for generator in self.column_generators.iter_mut() {
+            generator.reset();
+        }
+
+        Ok(())
     }
 }
 
@@ -379,18 +350,9 @@ fn test_reset() {
 }
 
 #[test]
-fn test_encoding() {
-    let mut generator = NativeColumnGenerator::<i32>::new();
-
-    for i in 0..1_000 {
-        generator.append_value(&Value::Int(10)).unwrap();
-    }
-
-    let block = generator.generate_block();
-}
-
-#[test]
 fn test_table_generator() {
+    use std::io::{Seek, Read};
+
     let mut buffer = Vec::<u8>::new();
     let mut buf_writer = io::Cursor::new(buffer);
 
@@ -400,51 +362,44 @@ fn test_table_generator() {
         v
     };
 
-    let mut table_writer = TableWriter::new(1_000, generators, &mut buf_writer);
+    let mut table_writer = TableWriter::new_into(buf_writer, 1_000, generators);
+    let num_blocks = 10;
 
-    for block in 0..100 {
+    for block in 0..num_blocks {
         for i in 0..table_writer.block_size {
             let value = block*i;
             let row = vec![Value::Int(value as i64)];
 
-            table_writer.append_row(row).unwrap();
+            table_writer.append_row(&row).unwrap();
         }
     }
+
+    assert_eq!(table_writer.table_metadata.blocks.len(), num_blocks);
+
+    table_writer.append_row(&vec![Value::Int(10)]).unwrap();
+    assert_eq!(table_writer.num_rows_in_current_block, 1);
+
+    let mut table: io::Cursor<Vec<u8>> = table_writer.finalize();
+    let mut buffer: [u8; 4] = [0; 4];
+
+    table.seek(io::SeekFrom::Start(0)).unwrap();
+    table.read_exact(&mut buffer).unwrap();
+    assert_eq!(buffer, HEADER);
+
+    table.seek(io::SeekFrom::End(-4)).unwrap();
+    table.read_exact(&mut buffer).unwrap();
+    assert_eq!(buffer, HEADER);
 }
 
 #[test]
-fn test_nulls_bitmap() {
-    let mut bitmap = NullsBitmap::new();
-    assert_eq!(bitmap.len(), 0);
+fn test_storage_chunk_size() {
+    // Makes sure the storage chunks report the right size
+    let chunk = StorageChunk {
+        compressed_nulls_bitmap: 
+            EncodedCompressedBuffer::from(&Encoder::Flat, &Compressor::Raw, &vec![1,2,3]),
+        compressed_values: 
+            EncodedCompressedBuffer::from(&Encoder::Flat, &Compressor::Raw, &vec![4,5])
+    };
 
-    bitmap.append_null();
-    bitmap.append_null();
-    bitmap.append_not_null();
-    bitmap.append_null();
-
-    {
-        let bits = bitmap.get_raw_bits();
-        assert_eq!(bitmap.len(), 4);
-        assert_eq!(bits.len(), 1);
-        assert_eq!(*bits.get(0).unwrap(), 0b00000100);
-    }
-
-    bitmap.append_null();
-    bitmap.append_not_null();
-    bitmap.append_null();
-    bitmap.append_not_null();
-    // End of first byte
-
-    bitmap.append_not_null();
-
-    {
-        let bits = bitmap.get_raw_bits();
-        assert_eq!(bitmap.len(), 9);
-        assert_eq!(bits.len(), 2);
-        assert_eq!(*bits.get(0).unwrap(), 0b10100100);
-        assert_eq!(*bits.get(1).unwrap(), 0b00000001);
-    }
-
-    bitmap.reset();
-    assert_eq!(bitmap.len(), 0);
+    assert_eq!(chunk.get_total_compressed_size(), 5);
 }
