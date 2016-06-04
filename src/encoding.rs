@@ -1,4 +1,6 @@
-use std::fmt;
+use ::std::fmt;
+
+use utils::get_slice_bytes;
 
 #[derive(Debug, Clone, RustcEncodable, RustcDecodable)]
 pub enum Encoder {
@@ -6,19 +8,18 @@ pub enum Encoder {
     RLE
 }
 
-#[derive(Debug)]
-pub struct EncoderError;
-
 impl Encoder {
-    pub fn encode<T>(&self, values: &[T]) -> Result<Vec<T>, EncoderError> 
-        where T: Clone
+    pub fn encode<T: Sized>(&self, values: &[T]) -> Vec<u8>
     {
-        let encoded: Vec<T> = match *self {
-            Encoder::Flat => Vec::from(values),
-            Encoder::RLE => unimplemented!()
-        };
+        match *self {
+            Encoder::Flat => {
+                // Copy the raw bytes
+                let bytes: &[u8] = get_slice_bytes(values);
+                Vec::from(bytes)
 
-        Ok(encoded)
+            },
+            Encoder::RLE => unimplemented!()
+        }
     }
 }
 
